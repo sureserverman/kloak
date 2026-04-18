@@ -120,6 +120,7 @@ MANPAGES := auto-generated-man-pages/kloak.8
 man : $(MANPAGES)
 
 auto-generated-man-pages/% : man/%.ronn
+	mkdir -p $(@D)
 	ronn --manual="kloak Manual" --organization="kloak" <$< >$@
 
 clean :
