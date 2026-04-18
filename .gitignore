@@ -19,3 +19,19 @@ debian/files
 debian/kloak.*.debhelper
 debian/kloak.substvars
 debian/tmp-man/
+debian/.debhelper/
+debian/kloak/
+debian/tmp/
+src/xdg-shell-protocol.[ch]
+src/xdg-output-protocol.[ch]
+src/wlr-layer-shell.[ch]
+src/wlr-virtual-pointer.[ch]
+src/virtual-keyboard.[ch]
+auto-generated-man-pages/kloak.8
+
+# Project-convention deb build artifacts
+/deb/amd64/*
+/deb/arm64/*
+/deb/package/usr/
+/deb/package/etc/
+/kloak_*_*.deb

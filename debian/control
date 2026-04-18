@@ -12,7 +12,8 @@ Build-Depends: debhelper (>= 13.11.4),
  libinput-dev,
  libwayland-dev,
  libxkbcommon-dev,
- pkgconf
+ pkgconf,
+ ronn
 Homepage: https://github.com/vmonaco/kloak
 Vcs-Browser: https://github.com/vmonaco/kloak
 Vcs-Git: https://github.com/vmonaco/kloak.git
