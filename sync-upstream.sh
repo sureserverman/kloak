@@ -16,7 +16,10 @@
 
 set -euo pipefail
 
-UPSTREAM_REF="origin/master"
+UPSTREAM_REMOTE="upstream"
+UPSTREAM_URL="https://github.com/Whonix/kloak"
+UPSTREAM_BRANCH="master"
+UPSTREAM_REF="$UPSTREAM_REMOTE/$UPSTREAM_BRANCH"
 SYNC_FILE=".upstream-sync"
 
 # upstream path  ->  local destination
@@ -44,7 +47,20 @@ cmd=${1:-check}
 
 cd "$(git rev-parse --show-toplevel)"
 
-git fetch origin >/dev/null 2>&1
+# Ensure the upstream remote exists and points where we expect. We deliberately
+# don't reuse `origin` because once you push this fork to your own GitHub,
+# origin will be your fork, not Whonix.
+if ! git remote get-url "$UPSTREAM_REMOTE" >/dev/null 2>&1; then
+  echo "==> Adding remote '$UPSTREAM_REMOTE' -> $UPSTREAM_URL"
+  git remote add "$UPSTREAM_REMOTE" "$UPSTREAM_URL"
+else
+  current_url=$(git remote get-url "$UPSTREAM_REMOTE")
+  if [[ "$current_url" != "$UPSTREAM_URL" ]]; then
+    echo "WARNING: remote '$UPSTREAM_REMOTE' is $current_url (expected $UPSTREAM_URL)"
+  fi
+fi
+
+git fetch "$UPSTREAM_REMOTE" "$UPSTREAM_BRANCH" >/dev/null 2>&1
 upstream_head=$(git rev-parse "$UPSTREAM_REF")
 
 if [[ "$cmd" == "init" ]]; then

@@ -65,11 +65,12 @@ Requires a **Wayland session**. Won't do anything useful under X11.
 
 ## Tracking upstream
 
-`origin` already points to `https://github.com/Whonix/kloak`. Use the
-selective sync script — it copies only the upstream paths we use into our
-restructured layout (`c/src`, `c/protocol`, `c/man`, `deb/package/etc`,
-`deb/package/usr`) and 3-way merges `Makefile` so the publish-toolkit
-targets at the bottom are preserved.
+Use the selective sync script — it manages its own `upstream` remote
+(pointing at `https://github.com/Whonix/kloak`, independent of whatever
+`origin` points to in your fork) and copies only the upstream paths we
+use into our restructured layout (`c/src`, `c/protocol`, `c/man`,
+`deb/package/etc`, `deb/package/usr`). It 3-way merges `Makefile` so the
+publish-toolkit targets at the bottom survive upstream edits.
 
 ```bash
 ./sync-upstream.sh           # check what's new, no writes
