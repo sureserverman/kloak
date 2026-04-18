@@ -14,7 +14,7 @@
 //!
 //! Callers do NOT reach into the internal buffer — only through
 //! `Scheduler::{enqueue_key, enqueue_button, enqueue_motion, enqueue_scroll,
-//! pop_due, next_deadline}`.
+//! enqueue_abs_pos, pop_due, next_deadline}`.
 
 use crate::event::InputPacket;
 use std::collections::VecDeque;
@@ -137,6 +137,14 @@ impl Scheduler {
             return;
         }
         self.enqueue(now, rng, InputPacket::Scroll { vert, horiz });
+    }
+
+    /// Enqueue an absolute-position packet (VM-tablet passthrough). Unlike
+    /// `enqueue_motion`, these do not coalesce — each sample is a distinct
+    /// cursor point and must fire in order so the cursor path through
+    /// userspace mirrors the host-side movement.
+    pub fn enqueue_abs_pos(&mut self, now: i64, rng: &mut dyn RandBetween, x: i32, y: i32) {
+        self.enqueue(now, rng, InputPacket::AbsPos { x, y });
     }
 
     /// Pop every packet whose `sched_time <= now` from the front of the queue,
@@ -347,5 +355,33 @@ mod tests {
     fn next_deadline_none_when_empty() {
         let s = Scheduler::new(100);
         assert_eq!(s.next_deadline(), None);
+    }
+
+    #[test]
+    fn enqueue_abs_pos_produces_one_packet() {
+        let mut s = Scheduler::new(50);
+        let mut rng = MinRng;
+        s.enqueue_abs_pos(0, &mut rng, 1000, 2000);
+        assert_eq!(s.queue_len(), 1);
+        let pkts = s.pop_due(1_000_000);
+        assert_eq!(pkts.len(), 1);
+        match pkts[0].packet {
+            InputPacket::AbsPos { x, y } => {
+                assert_eq!(x, 1000);
+                assert_eq!(y, 2000);
+            }
+            _ => panic!("expected AbsPos"),
+        }
+    }
+
+    #[test]
+    fn abs_pos_does_not_coalesce() {
+        // Back-to-back enqueues must produce two packets — unlike motion,
+        // samples are distinct points along a path.
+        let mut s = Scheduler::new(100);
+        let mut rng = MaxRng;
+        s.enqueue_abs_pos(0, &mut rng, 100, 100);
+        s.enqueue_abs_pos(10, &mut rng, 200, 200);
+        assert_eq!(s.queue_len(), 2);
     }
 }
