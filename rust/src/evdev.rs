@@ -195,7 +195,7 @@ impl EvdevDevice {
         }
     }
 
-    fn open(name: &str) -> io::Result<Option<Self>> {
+    fn open(name: &str, suppress_vm_tablet: bool) -> io::Result<Option<Self>> {
         let path: PathBuf = format!("/dev/input/{name}").into();
         let file = OpenOptions::new()
             .read(true)
@@ -221,14 +221,26 @@ impl EvdevDevice {
             DeviceClass::Skip => return Ok(None),
             DeviceClass::KeyOrRel => (None, None),
             DeviceClass::VmTablet => {
-                let x_info = query_absinfo(fd, ABS_X as u8)?;
-                let y_info = query_absinfo(fd, ABS_Y as u8)?;
-                if x_info.maximum <= 0 || y_info.maximum <= 0 {
-                    // Defensive: a zero/negative range would divide by zero
-                    // in the translate-layer normalization. Skip quietly.
-                    return Ok(None);
+                if suppress_vm_tablet {
+                    // A VM tablet was already attached (e.g. QEMU USB Tablet)
+                    // and a second duplicate pointer source showed up (e.g.
+                    // spice vdagent tablet creating its own /dev/input/eventN).
+                    // Grab the device exclusively so the compositor doesn't
+                    // read it directly — but leave `abs_x_max` = None so the
+                    // translate layer silently drops its ABS events. Without
+                    // this the two streams interleave in the scheduler and
+                    // the cursor jumps between sources.
+                    (None, None)
+                } else {
+                    let x_info = query_absinfo(fd, ABS_X as u8)?;
+                    let y_info = query_absinfo(fd, ABS_Y as u8)?;
+                    if x_info.maximum <= 0 || y_info.maximum <= 0 {
+                        // Defensive: a zero/negative range would divide by zero
+                        // in the translate-layer normalization. Skip quietly.
+                        return Ok(None);
+                    }
+                    (Some(x_info.maximum), Some(y_info.maximum))
                 }
-                (Some(x_info.maximum), Some(y_info.maximum))
             }
         };
 
@@ -314,7 +326,8 @@ impl EvdevCtx {
         if self.devices.contains_key(name) {
             self.detach(name);
         }
-        match EvdevDevice::open(name) {
+        let suppress_vm_tablet = self.has_vm_tablet();
+        match EvdevDevice::open(name, suppress_vm_tablet) {
             Ok(Some(dev)) => {
                 self.devices.insert(name.to_string(), dev);
             }
@@ -326,6 +339,10 @@ impl EvdevCtx {
                 eprintln!("WARNING: could not open /dev/input/{}: {}", name, e);
             }
         }
+    }
+
+    fn has_vm_tablet(&self) -> bool {
+        self.devices.values().any(|d| d.frame.abs_x_max.is_some())
     }
 
     /// Detach by short name. No-op if not tracked.
