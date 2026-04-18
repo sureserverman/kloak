@@ -92,6 +92,37 @@ const fn eviocgbit(ev: u8, len: u32) -> libc::c_ulong {
     ioc(IOC_READ, b'E', 0x20u16 + ev as u16, len) as libc::c_ulong
 }
 
+/// `struct input_absinfo` exactly as the kernel writes it. All fields
+/// are `__s32`, total 24 bytes on every arch kloak targets.
+#[repr(C)]
+#[derive(Copy, Clone, Default, Debug)]
+pub struct InputAbsinfo {
+    pub value: i32,
+    pub minimum: i32,
+    pub maximum: i32,
+    pub fuzz: i32,
+    pub flat: i32,
+    pub resolution: i32,
+}
+
+/// `EVIOCGABS(abs) = _IOR('E', 0x40 + abs, struct input_absinfo)`.
+const fn eviocgabs(abs: u8) -> libc::c_ulong {
+    ioc(IOC_READ, b'E', 0x40u16 + abs as u16, size_of::<InputAbsinfo>() as u32)
+        as libc::c_ulong
+}
+
+fn query_absinfo(fd: RawFd, abs: u8) -> io::Result<InputAbsinfo> {
+    let mut info = InputAbsinfo::default();
+    // SAFETY: EVIOCGABS writes exactly size_of::<InputAbsinfo>() bytes into
+    // the pointer. `fd` is a live evdev fd.
+    let rc = unsafe { libc::ioctl(fd, eviocgabs(abs), &mut info as *mut InputAbsinfo) };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(info)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 
@@ -315,6 +346,18 @@ mod tests {
         assert_eq!(eviocgbit(0, 4), 0x8004_4520);
         // EVIOCGBIT(EV_REL, 2) = 0x80024522.
         assert_eq!(eviocgbit(EV_REL as u8, 2), 0x8002_4522);
+    }
+
+    #[test]
+    fn eviocgabs_number_matches_kernel_abi() {
+        // EVIOCGABS(ABS_X) = _IOR('E', 0x40, struct input_absinfo(24 bytes)).
+        assert_eq!(eviocgabs(ABS_X as u8), 0x8018_4540);
+        assert_eq!(eviocgabs(ABS_Y as u8), 0x8018_4541);
+    }
+
+    #[test]
+    fn input_absinfo_size_is_24_bytes() {
+        assert_eq!(size_of::<InputAbsinfo>(), 24);
     }
 
     #[test]
