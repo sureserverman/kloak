@@ -28,6 +28,39 @@ pub const EV_ABS: u16 = 0x03;
 
 pub const SYN_REPORT: u16 = 0x00;
 
+pub const ABS_X: u16 = 0x00;
+pub const ABS_Y: u16 = 0x01;
+pub const ABS_MT_SLOT: u16 = 0x2f;
+
+/// Coarse classification: after reading the EV_* capability bitmap and (for
+/// EV_ABS devices) the ABS code bitmap, what should we do with this device?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceClass {
+    /// Keyboard or relative-motion mouse. Grab and translate EV_KEY/EV_REL.
+    KeyOrRel,
+    /// VM absolute tablet (QEMU USB Tablet / virtio-tablet). Grab and
+    /// translate EV_KEY + ABS_X/ABS_Y.
+    VmTablet,
+    /// Real touchpad, pure-ABS device, or anything else we can't faithfully
+    /// mirror. Leave alone so the compositor can talk to it directly.
+    Skip,
+}
+
+fn classify(ev_bits: &[u8], abs_bits: &[u8]) -> DeviceClass {
+    let has_key = has_bit(ev_bits, EV_KEY as usize);
+    let has_abs = has_bit(ev_bits, EV_ABS as usize);
+    if !has_key {
+        return DeviceClass::Skip;
+    }
+    if !has_abs {
+        return DeviceClass::KeyOrRel;
+    }
+    if has_bit(abs_bits, ABS_MT_SLOT as usize) {
+        return DeviceClass::Skip;
+    }
+    DeviceClass::VmTablet
+}
+
 /// `struct input_event` exactly as the kernel writes it. Layout is stable
 /// evdev ABI on every Linux architecture kloak targets (amd64/aarch64 use
 /// 16-byte `struct timeval`, so total size is 24 bytes).
@@ -295,6 +328,57 @@ mod tests {
         let bits = [0, 0b0000_1000u8, 0, 0];
         assert!(has_bit(&bits, 11));
         assert!(!has_bit(&bits, 10));
+    }
+
+    fn make_ev_bits(types: &[u16]) -> [u8; 4] {
+        let mut b = [0u8; 4];
+        for &t in types {
+            b[(t / 8) as usize] |= 1 << (t % 8);
+        }
+        b
+    }
+
+    fn make_abs_bits(codes: &[u16]) -> [u8; 8] {
+        let mut b = [0u8; 8];
+        for &c in codes {
+            b[(c / 8) as usize] |= 1 << (c % 8);
+        }
+        b
+    }
+
+    #[test]
+    fn classify_vm_tablet_has_abs_no_mt() {
+        let ev_bits = make_ev_bits(&[EV_KEY, EV_ABS]);
+        let abs_bits = make_abs_bits(&[ABS_X, ABS_Y]);
+        assert_eq!(classify(&ev_bits, &abs_bits), DeviceClass::VmTablet);
+    }
+
+    #[test]
+    fn classify_real_touchpad_has_mt_slot() {
+        let ev_bits = make_ev_bits(&[EV_KEY, EV_ABS]);
+        let abs_bits = make_abs_bits(&[ABS_X, ABS_Y, ABS_MT_SLOT]);
+        assert_eq!(classify(&ev_bits, &abs_bits), DeviceClass::Skip);
+    }
+
+    #[test]
+    fn classify_keyboard_no_abs() {
+        let ev_bits = make_ev_bits(&[EV_KEY]);
+        let abs_bits = [0u8; 8];
+        assert_eq!(classify(&ev_bits, &abs_bits), DeviceClass::KeyOrRel);
+    }
+
+    #[test]
+    fn classify_rel_mouse() {
+        let ev_bits = make_ev_bits(&[EV_KEY, EV_REL]);
+        let abs_bits = [0u8; 8];
+        assert_eq!(classify(&ev_bits, &abs_bits), DeviceClass::KeyOrRel);
+    }
+
+    #[test]
+    fn classify_no_ev_key_is_skipped() {
+        let ev_bits = make_ev_bits(&[EV_ABS]);
+        let abs_bits = make_abs_bits(&[ABS_X, ABS_Y]);
+        assert_eq!(classify(&ev_bits, &abs_bits), DeviceClass::Skip);
     }
 
     #[test]
