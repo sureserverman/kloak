@@ -4,56 +4,68 @@ Ubuntu `.deb` build of [Whonix/kloak](https://github.com/Whonix/kloak) — keyst
 
 ## Layout
 
-Follows the project's standard deb convention:
+Conforms to the project's standard publishable-deb layout (rust projects use `rust/Makefile`; this is the C analog):
 
 ```
 kloak-ubuntu/
-├── src/                         upstream C source
-├── protocol/                    upstream Wayland protocol XML
-├── Makefile                     upstream make rules (compiles kloak binary + man page)
-├── etc/apparmor.d/              upstream AppArmor profiles (shipped as-is)
-├── usr/                         upstream helper + systemd unit (shipped as-is)
+├── c/
+│   ├── src/                         upstream C source
+│   ├── protocol/                    upstream Wayland protocol XML
+│   ├── man/                         ronn man-page source
+│   └── Makefile                     upstream make rules + publish-toolkit
+│                                    targets (x86_64, aarch64, bootstrap)
 ├── deb/
-│   ├── amd64/                   compiled binary staged here by build-deb.sh
+│   ├── amd64/                       compiled binary staged here by `make x86_64`
+│   ├── arm64/                       compiled binary staged here by `make aarch64`
 │   └── package/
-│       ├── DEBIAN/
-│       │   ├── control
-│       │   ├── postinst         reloads AppArmor profile, systemd daemon-reload
-│       │   └── prerm            stops and disables the service
-│       ├── etc/apparmor.d/      (populated at build time)
-│       ├── usr/bin/kloak
-│       ├── usr/libexec/kloak/
-│       ├── usr/lib/systemd/system/kloak.service
-│       └── usr/share/man/man8/kloak.8.gz
-├── build-deb.sh                 one-shot build
-├── debian/                      upstream Whonix debhelper tree (unused here; kept for diff reference)
+│       ├── DEBIAN/{control,postinst,prerm}
+│       ├── etc/apparmor.d/          apparmor profiles
+│       └── usr/
+│           ├── bin/kloak            (build output, gitignored)
+│           ├── libexec/kloak/find_wl_compositor
+│           ├── lib/systemd/system/kloak.service
+│           └── share/man/man8/kloak.8.gz   (build output, gitignored)
+├── debian/                          upstream Whonix debhelper tree (parallel
+│                                    debuild flow; not used by publish)
 └── README-UBUNTU.md
 ```
 
-## Build
+## Build & publish
 
-```
-./build-deb.sh
+The build is driven by `~/dev/utils/publish` (see `~/dev/utils/README.md`):
+
+```bash
+cd ~/dev/utils && ./publish kloak-ubuntu
 ```
 
-Script compiles via upstream Makefile, stages the binary into `deb/amd64/kloak`, assembles the `deb/package/` filesystem, and runs `dpkg-deb --build`. Output: `./kloak_<version>_amd64.deb`.
+This compiles for both `amd64` and `arm64`, builds two `.deb`s, includes them in `reprepro` for every distro listed in `distr.list`, and rsyncs the repo to the remote host.
+
+For amd64 only (no cross-toolchain needed), `make -C c x86_64` produces `deb/amd64/kloak`.
+
+## arm64 (cross-compile)
+
+One-time setup:
+
+```bash
+make -C c bootstrap
+```
+
+This adds `arm64` as a foreign Debian architecture and installs the host build deps plus `crossbuild-essential-arm64` and `:arm64` dev libs for `libevdev`, `libinput`, `libwayland`, `libxkbcommon`. Uses `sudo`.
+
+After bootstrap, `make -C c aarch64` (or the publish run above) cross-compiles for `aarch64-linux-gnu` and stages the binary at `deb/arm64/kloak`.
 
 ## Install
 
-```
+```bash
 sudo apt install ./kloak_0.7.5_amd64.deb
 sudo systemctl enable --now kloak
 ```
 
 Requires a **Wayland session**. Won't do anything useful under X11.
 
-## arm64
-
-Not yet wired up. To add: install a cross-toolchain (or build on an aarch64 host), compile, and add an `arm64` path through `build-deb.sh` that stages into `deb/arm64/` and flips `Architecture:` to `arm64` in a second control file.
-
 ## Tracking upstream
 
-```
+```bash
 git remote add upstream https://github.com/Whonix/kloak
 git fetch upstream
 git merge upstream/master

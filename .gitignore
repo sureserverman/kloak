@@ -1,4 +1,4 @@
-/kloak
+/c/kloak
 eventcap
 cmake-build-debug/
 .idea/
@@ -22,16 +22,18 @@ debian/tmp-man/
 debian/.debhelper/
 debian/kloak/
 debian/tmp/
-src/xdg-shell-protocol.[ch]
-src/xdg-output-protocol.[ch]
-src/wlr-layer-shell.[ch]
-src/wlr-virtual-pointer.[ch]
-src/virtual-keyboard.[ch]
-auto-generated-man-pages/kloak.8
+c/src/xdg-shell-protocol.[ch]
+c/src/xdg-output-protocol.[ch]
+c/src/wlr-layer-shell.[ch]
+c/src/wlr-virtual-pointer.[ch]
+c/src/virtual-keyboard.[ch]
+c/auto-generated-man-pages/kloak.8
 
 # Project-convention deb build artifacts
 /deb/amd64/*
+!/deb/amd64/.gitkeep
 /deb/arm64/*
-/deb/package/usr/
-/deb/package/etc/
+!/deb/arm64/.gitkeep
+/deb/package/usr/bin/
+/deb/package/usr/share/man/
 /kloak_*_*.deb
