@@ -194,17 +194,27 @@ fn enumerate_input_devices(ctx: &mut kloak::evdev::EvdevCtx) {
             std::process::exit(1);
         }
     };
-    for entry in dir.flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if !name_str.starts_with("event") {
-            continue;
-        }
-        if let Ok(ft) = entry.file_type() {
-            if !ft.is_char_device() {
-                continue;
-            }
-        }
+    // Collect + sort by name so enumeration is deterministic. Matters when
+    // multiple VM tablets coexist (QEMU USB Tablet on event2 vs. spice
+    // vdagent tablet on event4): the dedup logic in EvdevCtx::attach picks
+    // the first-attached VM tablet as the ABS forwarder, so lower-numbered
+    // devices — which are the real emulated hardware — win over later
+    // userspace uinput helpers.
+    let mut names: Vec<String> = dir
+        .flatten()
+        .filter(|e| {
+            e.file_name().to_string_lossy().starts_with("event")
+                && e.file_type().map(|t| t.is_char_device()).unwrap_or(false)
+        })
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    // Numeric sort on the suffix after "event" so event2 < event10.
+    names.sort_by_key(|n| {
+        n.trim_start_matches("event")
+            .parse::<u32>()
+            .unwrap_or(u32::MAX)
+    });
+    for name_str in names {
         if is_self_uinput(&name_str) {
             continue;
         }

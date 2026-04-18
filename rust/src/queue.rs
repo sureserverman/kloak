@@ -139,12 +139,37 @@ impl Scheduler {
         self.enqueue(now, rng, InputPacket::Scroll { vert, horiz });
     }
 
-    /// Enqueue an absolute-position packet (VM-tablet passthrough). Unlike
-    /// `enqueue_motion`, these do not coalesce — each sample is a distinct
-    /// cursor point and must fire in order so the cursor path through
-    /// userspace mirrors the host-side movement.
-    pub fn enqueue_abs_pos(&mut self, now: i64, rng: &mut dyn RandBetween, x: i32, y: i32) {
-        self.enqueue(now, rng, InputPacket::AbsPos { x, y });
+    /// Enqueue an absolute-position packet (VM-tablet passthrough).
+    ///
+    /// Unlike keystrokes/clicks/scroll, cursor position is NOT timing-
+    /// randomized: the scheduler uses `sched_time = now` so the packet
+    /// fires on the next tick, and consecutive AbsPos at the tail are
+    /// coalesced so only the latest cursor coordinate survives.
+    ///
+    /// Rationale: per-sample random delay produces an erratic cursor
+    /// (samples emit in monotonic schedule order but with large inter-
+    /// sample gaps, so the cursor appears to "catch up" in bursts —
+    /// visually indistinguishable from jumping). Cursor position
+    /// already leaks far more information than its per-sample timing,
+    /// so the keystroke-timing anonymization goal is unaffected.
+    ///
+    /// `rng` is accepted for signature symmetry with the other enqueue
+    /// methods but unused.
+    pub fn enqueue_abs_pos(&mut self, now: i64, _rng: &mut dyn RandBetween, x: i32, y: i32) {
+        if let Some(last) = self.queue.back_mut() {
+            if let InputPacket::AbsPos { .. } = last.packet {
+                if last.sched_time >= now {
+                    last.packet = InputPacket::AbsPos { x, y };
+                    return;
+                }
+            }
+        }
+        let sched_time = now.max(self.prev_release_time);
+        self.queue.push_back(ScheduledPacket {
+            sched_time,
+            packet: InputPacket::AbsPos { x, y },
+        });
+        self.prev_release_time = sched_time;
     }
 
     /// Pop every packet whose `sched_time <= now` from the front of the queue,
