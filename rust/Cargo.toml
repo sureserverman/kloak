@@ -1,0 +1,35 @@
+[package]
+name = "kloak"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "GPL-3.0-or-later"
+description = "Keystroke and mouse timing anonymizer (Rust rewrite in progress)"
+publish = false
+
+[[bin]]
+name = "kloak"
+path = "src/main.rs"
+
+[[bin]]
+name = "uinput-smoke"
+path = "src/bin/uinput_smoke.rs"
+
+[lib]
+name = "kloak"
+path = "src/lib.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+input = { version = "0.10", default-features = false, features = ["libinput_1_21"] }
+nix = { version = "0.31", default-features = false, features = ["poll", "fs", "inotify"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+opt-level = 3
+
+[profile.dev]
+panic = "abort"
