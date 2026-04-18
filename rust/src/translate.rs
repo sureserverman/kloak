@@ -57,6 +57,14 @@ pub struct FrameAccum {
     /// drop the low-res `REL_WHEEL` event to avoid double-counting.
     pub has_hi_res_vwheel: bool,
     pub has_hi_res_hwheel: bool,
+    /// Latest raw ABS_X / ABS_Y seen in the current SYN frame; flushed on
+    /// SYN_REPORT. Remains `None` outside VM-tablet devices.
+    pub pending_abs_x: Option<i32>,
+    pub pending_abs_y: Option<i32>,
+    /// `Some(max)` when the device is a VM tablet; drives normalization of
+    /// raw ABS_X/Y into the uinput sink's 0..=32767 output range.
+    pub abs_x_max: Option<i32>,
+    pub abs_y_max: Option<i32>,
 }
 
 /// Per-call translation context — everything shared across every raw

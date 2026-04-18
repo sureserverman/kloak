@@ -200,18 +200,33 @@ impl EvdevDevice {
         let fd = file.as_raw_fd();
 
         let ev_bits = query_bits::<4>(fd, 0)?;
-        let has_key = has_bit(&ev_bits, EV_KEY as usize);
         let has_rel = has_bit(&ev_bits, EV_REL as usize);
         let has_abs = has_bit(&ev_bits, EV_ABS as usize);
 
-        // Skip anything without EV_KEY (no keyboard or button events), and
-        // anything advertising EV_ABS (tablets, touchpads, joysticks,
-        // touchscreens) — we have no absolute-axis passthrough in our
-        // output uinput device, so grabbing these would make them
-        // unreachable to the compositor.
-        if !has_key || has_abs {
-            return Ok(None);
-        }
+        // Touchpad / tablet / touchscreen classification. VM tablets
+        // (QEMU USB Tablet, virtio-tablet) have EV_ABS without ABS_MT_SLOT
+        // and we grab them; real laptop touchpads advertise ABS_MT_SLOT and
+        // we leave them alone so their compositor-side gestures keep working.
+        let abs_bits: [u8; 8] = if has_abs {
+            query_bits::<8>(fd, EV_ABS as u8)?
+        } else {
+            [0u8; 8]
+        };
+
+        let (abs_x_max, abs_y_max) = match classify(&ev_bits, &abs_bits) {
+            DeviceClass::Skip => return Ok(None),
+            DeviceClass::KeyOrRel => (None, None),
+            DeviceClass::VmTablet => {
+                let x_info = query_absinfo(fd, ABS_X as u8)?;
+                let y_info = query_absinfo(fd, ABS_Y as u8)?;
+                if x_info.maximum <= 0 || y_info.maximum <= 0 {
+                    // Defensive: a zero/negative range would divide by zero
+                    // in the translate-layer normalization. Skip quietly.
+                    return Ok(None);
+                }
+                (Some(x_info.maximum), Some(y_info.maximum))
+            }
+        };
 
         let (has_hi_res_vwheel, has_hi_res_hwheel) = if has_rel {
             let rel_bits = query_bits::<2>(fd, EV_REL as u8)?;
@@ -243,6 +258,8 @@ impl EvdevDevice {
         let frame = FrameAccum {
             has_hi_res_vwheel,
             has_hi_res_hwheel,
+            abs_x_max,
+            abs_y_max,
             ..FrameAccum::default()
         };
         Ok(Some(Self {
@@ -285,7 +302,8 @@ impl EvdevCtx {
     /// Attach a device by short name (e.g. `"event3"`).
     ///
     /// Silently skips:
-    /// - Devices we cannot handle (no EV_KEY, or has EV_ABS).
+    /// - Devices we cannot handle (no EV_KEY, or real touchpads /
+    ///   touchscreens / tablets advertising ABS_MT_SLOT).
     /// - Open/grab errors other than "already tracked".
     /// - Already-tracked names, after first detaching (hot-unplug race).
     pub fn attach(&mut self, name: &str) {
@@ -297,7 +315,8 @@ impl EvdevCtx {
                 self.devices.insert(name.to_string(), dev);
             }
             Ok(None) => {
-                // Device doesn't match our filter (no EV_KEY, or has EV_ABS).
+                // Device doesn't match our filter (no EV_KEY, or real
+                // touchpad/touchscreen with ABS_MT_SLOT).
             }
             Err(e) => {
                 eprintln!("WARNING: could not open /dev/input/{}: {}", name, e);
