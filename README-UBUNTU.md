@@ -65,10 +65,17 @@ Requires a **Wayland session**. Won't do anything useful under X11.
 
 ## Tracking upstream
 
+`origin` already points to `https://github.com/Whonix/kloak`. Use the
+selective sync script — it copies only the upstream paths we use into our
+restructured layout (`c/src`, `c/protocol`, `c/man`, `deb/package/etc`,
+`deb/package/usr`) and 3-way merges `Makefile` so the publish-toolkit
+targets at the bottom are preserved.
+
 ```bash
-git remote add upstream https://github.com/Whonix/kloak
-git fetch upstream
-git merge upstream/master
+./sync-upstream.sh           # check what's new, no writes
+./sync-upstream.sh pull      # apply: copy + merge + bump .upstream-sync
 ```
 
-Bump `Version:` in `deb/package/DEBIAN/control` after merging.
+The last-applied upstream commit is recorded in `.upstream-sync` (tracked).
+After a sync, mirror any `debian/changelog` Version bump into
+`deb/package/DEBIAN/control` and rebuild via `cd ~/dev/utils && ./publish kloak-ubuntu`.
