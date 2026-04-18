@@ -48,6 +48,10 @@ const REL_WHEEL: u16 = 0x08;
 const REL_WHEEL_HI_RES: u16 = 0x0b;
 const REL_HWHEEL_HI_RES: u16 = 0x0c;
 
+const EV_ABS: u16 = 0x03;
+const ABS_X: u16 = 0x00;
+const ABS_Y: u16 = 0x01;
+
 const BUS_VIRTUAL: u16 = 0x06;
 
 const UINPUT_MAX_NAME_SIZE: usize = 80;
@@ -219,6 +223,10 @@ impl UInput {
                 if horiz != 0 {
                     self.emit(EV_REL, REL_HWHEEL, horiz)?;
                 }
+            }
+            InputPacket::AbsPos { x, y } => {
+                self.emit(EV_ABS, ABS_X, x)?;
+                self.emit(EV_ABS, ABS_Y, y)?;
             }
         }
         self.syn()

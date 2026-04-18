@@ -22,6 +22,9 @@ pub enum InputPacket {
     Motion { dx: i32, dy: i32 },
     /// Scroll in whole ticks (v120 / 120).
     Scroll { vert: i32, horiz: i32 },
+    /// Absolute pointer position normalized to 0..=32767 on both axes.
+    /// Emitted once per SYN frame from VM-tablet devices.
+    AbsPos { x: i32, y: i32 },
 }
 
 impl InputPacket {
@@ -45,6 +48,7 @@ impl fmt::Display for InputPacket {
             InputPacket::Scroll { vert, horiz } => {
                 write!(f, "Scroll(vert={vert}, horiz={horiz})")
             }
+            InputPacket::AbsPos { x, y } => write!(f, "AbsPos(x={x}, y={y})"),
         }
     }
 }
@@ -56,6 +60,17 @@ mod tests {
     #[test]
     fn motion_coalesces() {
         assert!(InputPacket::Motion { dx: 0, dy: 0 }.coalesces_with_motion());
+    }
+
+    #[test]
+    fn abs_pos_does_not_coalesce() {
+        assert!(!InputPacket::AbsPos { x: 0, y: 0 }.coalesces_with_motion());
+    }
+
+    #[test]
+    fn abs_pos_display_format() {
+        let p = InputPacket::AbsPos { x: 100, y: 200 };
+        assert_eq!(format!("{p}"), "AbsPos(x=100, y=200)");
     }
 
     #[test]
