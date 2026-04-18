@@ -52,6 +52,12 @@ const EV_ABS: u16 = 0x03;
 const ABS_X: u16 = 0x00;
 const ABS_Y: u16 = 0x01;
 
+/// Digitizer/tablet-tool BTN_* range. `BTN_TOOL_PEN`=0x140 .. `BTN_TOOL_QUADTAP`=0x14f.
+/// Advertising any of these alongside EV_ABS makes libinput treat the
+/// device as a drawing tablet.
+const BTN_TOOL_FIRST: u16 = 0x140;
+const BTN_TOOL_LAST: u16 = 0x14f;
+
 const BUS_VIRTUAL: u16 = 0x06;
 
 const UINPUT_MAX_NAME_SIZE: usize = 80;
@@ -175,10 +181,17 @@ impl UInput {
         // `ID_INPUT_MOUSE` and compositors map it to a pointer.
         ioctl_int(fd, UI_SET_PROPBIT, c_int::from(INPUT_PROP_POINTER))?;
 
-        // Advertise every KEY_ / BTN_ code. Matches C behavior — libinput
-        // will only deliver codes that exist on real devices, so
-        // over-advertising is safe and far simpler than enumerating.
+        // Advertise every KEY_ / BTN_ code EXCEPT the digitizer/tablet-tool
+        // range 0x140..=0x14f (BTN_TOOL_PEN, BTN_TOUCH, BTN_STYLUS, etc.).
+        // Advertising those in combination with EV_ABS makes libinput
+        // classify the device as a drawing tablet and reject it for
+        // missing tablet resolution. Skipping the range keeps us a plain
+        // pointer+keyboard, which is what compositors dispatch pointer
+        // events to.
         for code in 1..=KEY_MAX {
+            if (BTN_TOOL_FIRST..=BTN_TOOL_LAST).contains(&code) {
+                continue;
+            }
             set_keybit(fd, code)?;
         }
 
