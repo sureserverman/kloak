@@ -7,9 +7,10 @@ CARGO  ?= cargo
 BINARY := kloak
 DEB_DIR := $(abspath $(CURDIR)/../deb)
 
-# The arm64 sysroot is produced by c/build-arm64-sysroot.sh (shared with the
-# C build, since both targets need the same libinput/libevdev at link time).
-SYSROOT_ARM64 := $(abspath $(CURDIR)/../c/sysroot-arm64/root)
+# The arm64 sysroot is produced by build-arm64-sysroot.sh — a self-contained
+# fetch-from-ports.ubuntu.com script that drops libinput/libevdev/etc. under
+# $(CURDIR)/sysroot-arm64/. No apt magic required.
+SYSROOT_ARM64 := $(abspath $(CURDIR)/sysroot-arm64/root)
 
 TARGET_DIR_X86_64  := target/x86_64-unknown-linux-gnu/release
 TARGET_DIR_AARCH64 := target/aarch64-unknown-linux-gnu/release
@@ -48,12 +49,11 @@ x86_64 :
 	mkdir -p $(DEB_DIR)/amd64
 	install -m 0755 $(TARGET_DIR_X86_64)/$(BINARY) $(DEB_DIR)/amd64/$(BINARY)
 
-# arm64 cross-build. Reuses the self-contained sysroot the C build created at
-# c/sysroot-arm64/ (fetched from ports.ubuntu.com by build-arm64-sysroot.sh).
-# pkg-config is redirected into the sysroot so input-sys sees the arm64
-# libinput.pc, not the host amd64 one. The linker is the cross-gcc so crt
-# objects and libc come from the sysroot glued together with the cross
-# toolchain's libgcc.
+# arm64 cross-build. Uses the self-contained sysroot at rust/sysroot-arm64/
+# (fetched from ports.ubuntu.com by build-arm64-sysroot.sh). pkg-config is
+# redirected into the sysroot so input-sys sees the arm64 libinput.pc, not
+# the host amd64 one. The linker is the cross-gcc so crt objects and libc
+# come from the sysroot glued together with the cross toolchain's libgcc.
 aarch64 :
 	@command -v aarch64-linux-gnu-gcc >/dev/null 2>&1 || { \
 	  echo "ERROR: aarch64-linux-gnu-gcc not found. Run: make -C rust bootstrap"; \
@@ -65,7 +65,7 @@ aarch64 :
 	  exit 1; \
 	}
 	@test -f $(SYSROOT_ARM64)/usr/lib/aarch64-linux-gnu/pkgconfig/libinput.pc || \
-	    $(CURDIR)/../c/build-arm64-sysroot.sh
+	    $(CURDIR)/build-arm64-sysroot.sh
 	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
 	CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS='-C link-arg=--sysroot=$(SYSROOT_ARM64) -C link-arg=-Wl,--allow-shlib-undefined' \
 	PKG_CONFIG_ALLOW_CROSS=1 \

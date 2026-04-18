@@ -4,7 +4,7 @@
 #
 # No sudo. No /etc/apt changes. No dpkg --add-architecture. Idempotent.
 #
-# Output:  c/sysroot-arm64/  (sysroot suitable for PKG_CONFIG_SYSROOT_DIR)
+# Output:  rust/sysroot-arm64/  (sysroot suitable for PKG_CONFIG_SYSROOT_DIR)
 
 set -euo pipefail
 

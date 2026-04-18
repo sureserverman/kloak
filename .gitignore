@@ -1,5 +1,3 @@
-/c/kloak
-/c/uinput-smoke
 eventcap
 cmake-build-debug/
 .idea/
@@ -23,10 +21,8 @@ debian/tmp-man/
 debian/.debhelper/
 debian/kloak/
 debian/tmp/
-c/auto-generated-man-pages/kloak.8
-
-# arm64 cross-compile sysroot (built by c/build-arm64-sysroot.sh)
-/c/sysroot-arm64/
+# arm64 cross-compile sysroot (built by rust/build-arm64-sysroot.sh)
+/rust/sysroot-arm64/
 
 # Project-convention deb build artifacts
 /deb/amd64/*
