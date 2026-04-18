@@ -21,8 +21,7 @@ path = "src/lib.rs"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
-input = { version = "0.10", default-features = false, features = ["libinput_1_21"] }
-nix = { version = "0.31", default-features = false, features = ["poll", "fs", "inotify"] }
+nix = { version = "0.31", default-features = false, features = ["poll", "inotify"] }
 
 [profile.release]
 lto = "thin"

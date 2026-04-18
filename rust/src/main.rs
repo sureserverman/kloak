@@ -1,11 +1,10 @@
-//! kloak daemon entry point — Stage 5 full implementation.
+//! kloak daemon entry point.
 //!
-//! Matches the behaviour of `main()` in [c/src/kloak.c] including:
-//! - Refuse non-root (UID 0 required).
+//! - Refuse non-root.
 //! - `setenv("LC_ALL", "C")` before any locale-sensitive call.
-//! - Sleep `startup_delay` ms before touching uinput / libinput.
-//! - Enumerate `/dev/input/event*` and attach each via libinput path backend.
-//! - Poll loop: drain libinput → translate → schedule → emit due → poll.
+//! - Sleep `startup_delay` ms before touching uinput / evdev.
+//! - Enumerate `/dev/input/event*` and attach every keyboard/mouse.
+//! - Poll loop: drain every readable evdev fd → translate → emit due → poll.
 //! - inotify hotplug: attach on `IN_CREATE`, detach on `IN_DELETE`.
 //! - Exit 0 on escape combo.
 
@@ -18,15 +17,16 @@ fn main() {
 #[cfg(target_os = "linux")]
 fn main() {
     use kloak::config::{ParseOutcome, USAGE};
+    use kloak::evdev::EvdevCtx;
     use kloak::hotplug::{HotplugKind, Watcher};
-    use kloak::libinput_ctx::LibinputCtx;
     use kloak::time_src::now_ms;
-    use kloak::translate::{translate, VertHorizScrollAccum};
+    use kloak::translate::{handle_raw_event, TranslateCtx};
     use kloak::uinput::UInput;
     use kloak::urandom::UrandomRng;
     use kloak::Scheduler;
 
     use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+    use std::os::unix::io::BorrowedFd;
     use std::thread::sleep;
     use std::time::Duration;
 
@@ -37,7 +37,6 @@ fn main() {
         std::env::set_var("LC_ALL", "C");
     }
 
-    // Root check must match C: `if (getuid() != 0)`.
     // SAFETY: getuid() has no preconditions.
     if unsafe { libc::getuid() } != 0 {
         eprintln!("FATAL ERROR: Must be run as root!");
@@ -57,8 +56,6 @@ fn main() {
         }
     };
 
-    // Sleep before touching uinput/libinput so that a restarting service
-    // doesn't race with the system releasing grabbed devices.
     sleep(Duration::from_millis(cfg.startup_delay_ms as u64));
 
     let mut rng = UrandomRng::open().unwrap_or_else(|e| {
@@ -74,36 +71,41 @@ fn main() {
         std::process::exit(1);
     });
 
-    let mut li_ctx = LibinputCtx::new(cfg.natural_scrolling);
-
-    // Enumerate /dev/input/event* and attach each.
-    enumerate_input_devices(&mut li_ctx);
+    let mut ctx = EvdevCtx::new();
+    enumerate_input_devices(&mut ctx);
 
     let watcher = Watcher::new();
 
     let mut scheduler = Scheduler::new(cfg.max_delay_ms);
     let mut esc_combo = cfg.esc_combo.clone();
-    let mut scroll_accum = VertHorizScrollAccum::default();
 
-    // Main poll loop.
+    // Reused across poll iterations to avoid per-loop allocation.
+    let mut event_buf: Vec<(u16, u16, i32)> = Vec::with_capacity(64);
+
     loop {
-        // 1. Drain all pending libinput events → translate → enqueue.
-        li_ctx.drain_events(|event| {
-            let now = now_ms();
-            if translate(
-                &event,
-                &mut scheduler,
-                &mut rng,
-                now,
-                &mut esc_combo,
-                &mut scroll_accum,
-            ) {
-                // Escape combo triggered.
-                std::process::exit(0);
+        // 1. Drain every device's pending events, feed translate.
+        let names = ctx.names();
+        for name in &names {
+            let Some(dev) = ctx.device_mut(name) else {
+                continue;
+            };
+            event_buf.clear();
+            dev.drain_into(&mut event_buf);
+            for (type_, code, value) in event_buf.drain(..) {
+                let now = now_ms();
+                let mut tctx = TranslateCtx {
+                    scheduler: &mut scheduler,
+                    rng: &mut rng,
+                    esc_combo: &mut esc_combo,
+                    natural_scrolling: cfg.natural_scrolling,
+                };
+                if handle_raw_event(type_, code, value, &mut dev.frame, now, &mut tctx) {
+                    std::process::exit(0);
+                }
             }
-        });
+        }
 
-        // 2. Emit all packets whose scheduled time has passed.
+        // 2. Emit packets whose scheduled time has passed.
         let now = now_ms();
         for sp in scheduler.pop_due(now) {
             uinput.emit_packet(sp.packet).unwrap_or_else(|e| {
@@ -112,7 +114,7 @@ fn main() {
             });
         }
 
-        // 3. Compute poll timeout: milliseconds until next deadline, or -1.
+        // 3. Compute poll timeout.
         let timeout = match scheduler.next_deadline() {
             None => PollTimeout::NONE,
             Some(deadline) => {
@@ -120,40 +122,40 @@ fn main() {
                 if dur <= 0 {
                     PollTimeout::ZERO
                 } else {
-                    // Clamp to i32::MAX (poll's timeout type).
                     let ms = dur.min(i64::from(i32::MAX)) as i32;
                     PollTimeout::try_from(ms).unwrap_or(PollTimeout::NONE)
                 }
             }
         };
 
-        // 4. Poll libinput fd and inotify fd.
-        let li_fd_raw = li_ctx.fd();
-        let in_fd_raw = watcher.fd();
+        // 4. Build pollfd array: one per tracked device + inotify at end.
+        let names = ctx.names();
+        let mut raw_fds: Vec<std::os::unix::io::RawFd> = Vec::with_capacity(names.len() + 1);
+        for name in &names {
+            if let Some(dev) = ctx.device_mut(name) {
+                raw_fds.push(dev.fd());
+            }
+        }
+        raw_fds.push(watcher.fd());
 
-        // SAFETY: Both fds are valid for the duration of `poll`.
-        // We use `BorrowedFd` to satisfy nix's lifetime requirement.
-        let li_borrowed = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(li_fd_raw) };
-        let in_borrowed = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(in_fd_raw) };
+        // SAFETY: each fd is owned by `ctx` or `watcher`, both of which
+        // outlive this poll call.
+        let borrowed_fds: Vec<BorrowedFd> = raw_fds
+            .iter()
+            .map(|&fd| unsafe { BorrowedFd::borrow_raw(fd) })
+            .collect();
 
-        let mut pollfds = [
-            PollFd::new(li_borrowed, PollFlags::POLLIN),
-            PollFd::new(in_borrowed, PollFlags::POLLIN),
-        ];
+        let mut pollfds: Vec<PollFd> = borrowed_fds
+            .iter()
+            .map(|bfd| PollFd::new(*bfd, PollFlags::POLLIN))
+            .collect();
 
-        // poll() returns -1 on EINTR — just retry the loop.
+        // EINTR → retry by falling through to next iteration.
         let _ = poll(&mut pollfds, timeout);
 
-        // 5. If libinput fd is ready, dispatch.
-        if pollfds[0]
-            .revents()
-            .is_some_and(|f| f.contains(PollFlags::POLLIN))
-        {
-            li_ctx.dispatch();
-        }
-
-        // 6. If inotify fd is ready, handle hotplug.
-        if pollfds[1]
+        // 5. Inotify hotplug — always the last pollfd.
+        let inotify_idx = pollfds.len() - 1;
+        if pollfds[inotify_idx]
             .revents()
             .is_some_and(|f| f.contains(PollFlags::POLLIN))
         {
@@ -161,20 +163,18 @@ fn main() {
                 match ev.kind {
                     HotplugKind::Added => {
                         if !is_self_uinput(&ev.name) {
-                            li_ctx.attach(&ev.name);
+                            ctx.attach(&ev.name);
                         }
                     }
-                    HotplugKind::Removed => li_ctx.detach(&ev.name),
+                    HotplugKind::Removed => ctx.detach(&ev.name),
                 }
             }
         }
+        // Device POLLIN bits are consumed on the next iteration's drain
+        // pass — drain is non-blocking, so unconditional draining is fine.
     }
 }
 
-/// Return true if `/sys/class/input/<name>/device/name` identifies kloak's own
-/// uinput output device. Attaching our own sink creates a feedback loop: we
-/// EVIOCGRAB it exclusively, the compositor can no longer read the events we
-/// emit, and libinput re-feeds them into our translate path.
 #[cfg(target_os = "linux")]
 fn is_self_uinput(name: &str) -> bool {
     let path = format!("/sys/class/input/{name}/device/name");
@@ -183,13 +183,8 @@ fn is_self_uinput(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Enumerate `/dev/input` and attach every `event*` character device.
-///
-/// Matches `applayer_libinput_init` in kloak.c: opens the directory, iterates
-/// entries, filters for `DT_CHR` and `event*` prefix. Additionally skips the
-/// kloak-owned uinput sink (see `is_self_uinput`).
 #[cfg(target_os = "linux")]
-fn enumerate_input_devices(ctx: &mut kloak::libinput_ctx::LibinputCtx) {
+fn enumerate_input_devices(ctx: &mut kloak::evdev::EvdevCtx) {
     use std::os::unix::fs::FileTypeExt;
 
     let dir = match std::fs::read_dir("/dev/input") {
@@ -205,7 +200,6 @@ fn enumerate_input_devices(ctx: &mut kloak::libinput_ctx::LibinputCtx) {
         if !name_str.starts_with("event") {
             continue;
         }
-        // Filter for character devices, matching C's `entry->d_type != DT_CHR`.
         if let Ok(ft) = entry.file_type() {
             if !ft.is_char_device() {
                 continue;

@@ -27,7 +27,7 @@ pub mod time_src;
 pub mod urandom;
 
 #[cfg(target_os = "linux")]
-pub mod libinput_ctx;
+pub mod evdev;
 
 #[cfg(target_os = "linux")]
 pub mod hotplug;

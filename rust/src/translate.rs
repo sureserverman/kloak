@@ -1,192 +1,308 @@
-//! libinput event → scheduler translation.
+//! Raw-evdev event → scheduler translation.
 //!
-//! Port of `register_esc_combo_event` + `handle_libinput_event` in
-//! [c/src/kloak.c].
+//! Replaces the prior libinput-based translation. We buffer per-device
+//! deltas and key events until `EV_SYN/SYN_REPORT`, then flush the SYN frame
+//! into the scheduler. Keys are enqueued immediately (the escape combo must
+//! observe every press/release in kernel order); pointer motion and scroll
+//! are accumulated and emitted at SYN boundaries.
 //!
-//! The C function `handle_libinput_event` both translates events and calls
-//! `libinput_event_destroy`.  In the Rust crate, event lifetime is managed by
-//! the `input` crate's Drop impls, so no explicit destroy call is needed.
-//!
-//! Scroll accumulation state lives in `VertHorizScrollAccum` which the caller
-//! owns and passes in on each call so that sub-tick accumulation persists across
-//! events.
+//! Event-type coverage:
+//! - EV_KEY  → Key (code < `BTN_MISC`) or Button (code ≥ `BTN_MISC`).
+//!   value==2 (autorepeat) is dropped — matches libinput's behaviour and
+//!   lets the downstream compositor drive autorepeat on its own clock.
+//! - EV_REL REL_X/REL_Y → accumulated motion.
+//! - EV_REL REL_WHEEL_HI_RES/REL_HWHEEL_HI_RES → accumulated scroll in v120.
+//! - EV_REL REL_WHEEL/REL_HWHEEL → accumulated scroll, scaled ×120, only
+//!   when the device doesn't advertise a hi-res counterpart (avoids
+//!   double-counting).
+//! - EV_ABS — never reached; devices with ABS are filtered out at attach.
+//! - EV_MSC, EV_LED, EV_REP, … → dropped.
 
 use crate::escape::EscCombo;
 use crate::queue::{RandBetween, Scheduler};
 use crate::scroll::drain_ticks;
 
-use input::event::keyboard::{KeyState, KeyboardEventTrait};
-use input::event::pointer::{Axis, ButtonState, PointerScrollEvent};
-use input::event::Event;
+// ---------------------------------------------------------------------------
+// Kernel evdev ABI constants used by translation.
 
-/// Factor to convert finger/continuous scroll value to v120 units.
-/// Matches `SCROLL_ANGLE_TO_UNITS_FACTOR_D = 8.0` in kloak.c.
-const SCROLL_ANGLE_TO_UNITS: f64 = 8.0;
+const EV_KEY: u16 = 0x01;
+const EV_REL: u16 = 0x02;
+const EV_SYN: u16 = 0x00;
 
-/// Running scroll accumulator, one axis each.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct VertHorizScrollAccum {
-    pub vert: f64,
-    pub horiz: f64,
+const SYN_REPORT: u16 = 0x00;
+
+const REL_X: u16 = 0x00;
+const REL_Y: u16 = 0x01;
+const REL_HWHEEL: u16 = 0x06;
+const REL_WHEEL: u16 = 0x08;
+const REL_WHEEL_HI_RES: u16 = 0x0b;
+const REL_HWHEEL_HI_RES: u16 = 0x0c;
+
+/// Lowest pointer-button code in `<linux/input-event-codes.h>`. Codes below
+/// this are keyboard keys; codes at or above are mouse/joystick buttons.
+const BTN_MISC: u16 = 0x100;
+
+/// Per-device SYN-frame accumulator. Holds the between-SYN deltas plus
+/// the device's hi-res wheel capabilities (constant for the lifetime of
+/// the device, but kept here to keep `handle_raw_event`'s signature
+/// compact and so translate.rs stays independent of the evdev module).
+#[derive(Debug, Default, Clone)]
+pub struct FrameAccum {
+    pub dx: i32,
+    pub dy: i32,
+    /// Scroll in v120 units, combining hi-res and (scaled) low-res events.
+    pub vert_v120: f64,
+    pub horiz_v120: f64,
+    /// `true` when the device advertises `REL_WHEEL_HI_RES`. When set, we
+    /// drop the low-res `REL_WHEEL` event to avoid double-counting.
+    pub has_hi_res_vwheel: bool,
+    pub has_hi_res_hwheel: bool,
 }
 
-/// Round a float to the nearest integer, with ties going away from zero.
-/// Matches C `(int32_t)(dx < 0 ? dx - 0.5 : dx + 0.5)` for the motion path.
-fn round_half_away(v: f64) -> i32 {
-    // Clamp before converting to avoid saturating-cast UB in release mode
-    // (Rust 1.45+ saturates, but explicit clamp is clearer).
-    let rounded = if v < 0.0 { v - 0.5 } else { v + 0.5 };
-    rounded.max(f64::from(i32::MIN)).min(f64::from(i32::MAX)) as i32
+/// Per-call translation context — everything shared across every raw
+/// event within one poll iteration. Grouping these keeps
+/// `handle_raw_event`'s signature compact and makes the per-device
+/// (`accum`) vs. shared-across-devices split obvious.
+pub struct TranslateCtx<'a> {
+    pub scheduler: &'a mut Scheduler,
+    pub rng: &'a mut dyn RandBetween,
+    pub esc_combo: &'a mut EscCombo,
+    pub natural_scrolling: bool,
 }
 
-/// Translate a single libinput event into the scheduler.
-///
-/// Returns `true` if the escape combo was triggered (caller should exit 0).
-///
-/// The DEVICE_ADDED branch (tap/natural-scroll config) is handled in
-/// `LibinputCtx::drain_events` before events reach this function, so callers
-/// must not forward DEVICE_ADDED events here.
-pub fn translate(
-    event: &Event,
-    scheduler: &mut Scheduler,
-    rng: &mut dyn RandBetween,
-    now: i64,
-    esc_combo: &mut EscCombo,
-    accum: &mut VertHorizScrollAccum,
-) -> bool {
-    match event {
-        Event::Keyboard(kb_event) => {
-            use input::event::keyboard::KeyboardEvent;
-            let KeyboardEvent::Key(ref ke) = kb_event else {
-                return false;
-            };
-            let key = ke.key();
-            let pressed = ke.key_state() == KeyState::Pressed;
-
-            // Escape-combo check runs on every keyboard event, matching C
-            // `register_esc_combo_event` being called before `handle_libinput_event`.
-            if esc_combo.observe(key, pressed) {
-                return true;
-            }
-
-            scheduler.enqueue_key(now, rng, key, pressed);
-        }
-
-        Event::Pointer(ptr_event) => {
-            use input::event::pointer::PointerEvent;
-            match ptr_event {
-                PointerEvent::Button(ref be) => {
-                    let btn = be.button();
-                    let pressed = be.button_state() == ButtonState::Pressed;
-                    scheduler.enqueue_button(now, rng, btn, pressed);
-                }
-
-                PointerEvent::Motion(ref me) => {
-                    let dx = me.dx();
-                    let dy = me.dy();
-                    let idx = round_half_away(dx);
-                    let idy = round_half_away(dy);
-                    if idx != 0 || idy != 0 {
-                        scheduler.enqueue_motion(now, rng, idx, idy);
-                    }
-                }
-
-                PointerEvent::ScrollWheel(ref sw) => {
-                    // v120 units fed directly into the accumulator.
-                    if sw.has_axis(Axis::Vertical) {
-                        accum.vert += sw.scroll_value_v120(Axis::Vertical);
-                    }
-                    if sw.has_axis(Axis::Horizontal) {
-                        accum.horiz += sw.scroll_value_v120(Axis::Horizontal);
-                    }
-                    flush_scroll(scheduler, rng, now, accum);
-                }
-
-                PointerEvent::ScrollFinger(ref sf) => {
-                    if sf.has_axis(Axis::Vertical) {
-                        accum.vert += sf.scroll_value(Axis::Vertical) * SCROLL_ANGLE_TO_UNITS;
-                    }
-                    if sf.has_axis(Axis::Horizontal) {
-                        accum.horiz += sf.scroll_value(Axis::Horizontal) * SCROLL_ANGLE_TO_UNITS;
-                    }
-                    flush_scroll(scheduler, rng, now, accum);
-                }
-
-                PointerEvent::ScrollContinuous(ref sc) => {
-                    if sc.has_axis(Axis::Vertical) {
-                        accum.vert += sc.scroll_value(Axis::Vertical) * SCROLL_ANGLE_TO_UNITS;
-                    }
-                    if sc.has_axis(Axis::Horizontal) {
-                        accum.horiz += sc.scroll_value(Axis::Horizontal) * SCROLL_ANGLE_TO_UNITS;
-                    }
-                    flush_scroll(scheduler, rng, now, accum);
-                }
-
-                // Gestures, absolute motion, and deprecated Axis events are
-                // dropped — matching `/* Gestures and other events intentionally dropped. */`
-                // in the C source.
-                _ => {}
-            }
-        }
-
-        // Device / Touch / TabletTool / TabletPad / Switch / Gesture — all dropped.
-        _ => {}
+impl std::fmt::Debug for TranslateCtx<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `dyn RandBetween` isn't Debug; elide it to keep the trait small.
+        f.debug_struct("TranslateCtx")
+            .field("scheduler", &self.scheduler)
+            .field("esc_combo", &self.esc_combo)
+            .field("natural_scrolling", &self.natural_scrolling)
+            .finish_non_exhaustive()
     }
+}
 
+/// Feed one raw evdev event (kernel `input_event` tuple) into the
+/// accumulator / scheduler. Returns `true` when an `EV_KEY` event completed
+/// the escape combo — caller should exit 0.
+///
+/// `natural_scrolling`: if true, invert both scroll axes before emission.
+/// Matches the C `-n`/`--natural-scrolling` flag.
+pub fn handle_raw_event(
+    type_: u16,
+    code: u16,
+    value: i32,
+    accum: &mut FrameAccum,
+    now: i64,
+    ctx: &mut TranslateCtx<'_>,
+) -> bool {
+    match type_ {
+        EV_KEY => {
+            // value: 0=release, 1=press, 2=autorepeat. Drop autorepeat.
+            if value == 2 {
+                return false;
+            }
+            let pressed = value == 1;
+            if code < BTN_MISC {
+                // Escape combo only runs on keyboard keys, matching C.
+                if ctx.esc_combo.observe(u32::from(code), pressed) {
+                    return true;
+                }
+                ctx.scheduler
+                    .enqueue_key(now, ctx.rng, u32::from(code), pressed);
+            } else {
+                ctx.scheduler
+                    .enqueue_button(now, ctx.rng, u32::from(code), pressed);
+            }
+        }
+        EV_REL => match code {
+            REL_X => accum.dx = accum.dx.saturating_add(value),
+            REL_Y => accum.dy = accum.dy.saturating_add(value),
+            REL_WHEEL_HI_RES => accum.vert_v120 += f64::from(value),
+            REL_HWHEEL_HI_RES => accum.horiz_v120 += f64::from(value),
+            REL_WHEEL => {
+                if !accum.has_hi_res_vwheel {
+                    accum.vert_v120 += f64::from(value) * 120.0;
+                }
+            }
+            REL_HWHEEL => {
+                if !accum.has_hi_res_hwheel {
+                    accum.horiz_v120 += f64::from(value) * 120.0;
+                }
+            }
+            _ => {}
+        },
+        EV_SYN => {
+            if code == SYN_REPORT {
+                flush_frame(accum, now, ctx);
+            }
+            // SYN_DROPPED (code==3) is ignored: queue overflow means the
+            // client should re-sync its state with EVIOCGKEY/etc., but
+            // kloak is a stateless passthrough — the next SYN_REPORT will
+            // resume correct emission.
+        }
+        _ => {
+            // EV_MSC, EV_LED, EV_REP, EV_SND, EV_FF — all dropped.
+        }
+    }
     false
 }
 
-/// Drain whole ticks from both accumulators and enqueue a scroll packet.
-fn flush_scroll(
-    scheduler: &mut Scheduler,
-    rng: &mut dyn RandBetween,
-    now: i64,
-    accum: &mut VertHorizScrollAccum,
-) {
-    let vert = drain_ticks(&mut accum.vert);
-    let horiz = drain_ticks(&mut accum.horiz);
-    scheduler.enqueue_scroll(now, rng, vert, horiz);
+/// Drain a SYN frame: enqueue motion if nonzero, enqueue scroll if nonzero.
+fn flush_frame(accum: &mut FrameAccum, now: i64, ctx: &mut TranslateCtx<'_>) {
+    if accum.dx != 0 || accum.dy != 0 {
+        ctx.scheduler
+            .enqueue_motion(now, ctx.rng, accum.dx, accum.dy);
+        accum.dx = 0;
+        accum.dy = 0;
+    }
+    if accum.vert_v120 != 0.0 || accum.horiz_v120 != 0.0 {
+        let vert = drain_ticks(&mut accum.vert_v120);
+        let horiz = drain_ticks(&mut accum.horiz_v120);
+        let (vert, horiz) = if ctx.natural_scrolling {
+            (-vert, -horiz)
+        } else {
+            (vert, horiz)
+        };
+        ctx.scheduler.enqueue_scroll(now, ctx.rng, vert, horiz);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::escape::EscCombo;
+    use crate::queue::RandBetween;
 
-    #[test]
-    fn round_half_away_positive() {
-        // 2.5 → 3 (away from zero)
-        assert_eq!(round_half_away(2.5), 3);
-        // 2.4 → 2
-        assert_eq!(round_half_away(2.4), 2);
+    struct MinRng;
+    impl RandBetween for MinRng {
+        fn between(&mut self, lower: i64, _upper: i64) -> i64 {
+            lower
+        }
+    }
+
+    fn default_combo() -> EscCombo {
+        EscCombo::parse("KEY_RIGHTSHIFT,KEY_ESC").unwrap()
+    }
+
+    /// Bundle test scaffolding so each case stays a handful of lines.
+    struct Harness {
+        accum: FrameAccum,
+        scheduler: Scheduler,
+        rng: MinRng,
+        esc_combo: EscCombo,
+        natural_scrolling: bool,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            Self {
+                accum: FrameAccum::default(),
+                scheduler: Scheduler::new(100),
+                rng: MinRng,
+                esc_combo: default_combo(),
+                natural_scrolling: false,
+            }
+        }
+
+        fn with_natural(mut self) -> Self {
+            self.natural_scrolling = true;
+            self
+        }
+
+        fn feed(&mut self, type_: u16, code: u16, value: i32, hi_v: bool, hi_h: bool) -> bool {
+            self.accum.has_hi_res_vwheel = hi_v;
+            self.accum.has_hi_res_hwheel = hi_h;
+            let mut ctx = TranslateCtx {
+                scheduler: &mut self.scheduler,
+                rng: &mut self.rng,
+                esc_combo: &mut self.esc_combo,
+                natural_scrolling: self.natural_scrolling,
+            };
+            handle_raw_event(type_, code, value, &mut self.accum, 0, &mut ctx)
+        }
     }
 
     #[test]
-    fn round_half_away_negative() {
-        // -2.5 → -3 (away from zero)
-        assert_eq!(round_half_away(-2.5), -3);
-        // -2.4 → -2
-        assert_eq!(round_half_away(-2.4), -2);
+    fn key_press_enqueues() {
+        let mut h = Harness::new();
+        assert!(!h.feed(EV_KEY, 30, 1, false, false));
+        assert_eq!(h.scheduler.queue_len(), 1);
     }
 
     #[test]
-    fn round_half_away_zero() {
-        assert_eq!(round_half_away(0.0), 0);
+    fn autorepeat_is_dropped() {
+        let mut h = Harness::new();
+        // value == 2 is autorepeat.
+        h.feed(EV_KEY, 30, 2, false, false);
+        assert_eq!(h.scheduler.queue_len(), 0);
     }
 
     #[test]
-    fn round_half_away_clamps_large() {
-        assert_eq!(round_half_away(1e18_f64), i32::MAX);
-        assert_eq!(round_half_away(-1e18_f64), i32::MIN);
+    fn button_code_goes_to_button_branch() {
+        let mut h = Harness::new();
+        // BTN_LEFT = 0x110.
+        h.feed(EV_KEY, 0x110, 1, false, false);
+        assert_eq!(h.scheduler.queue_len(), 1);
     }
 
     #[test]
-    fn scroll_accum_flush_produces_ticks() {
-        let mut accum = VertHorizScrollAccum {
-            vert: 120.0,
-            ..Default::default()
-        };
-        let vert = drain_ticks(&mut accum.vert);
-        assert_eq!(vert, 1);
-        assert_eq!(accum.vert, 0.0);
+    fn escape_combo_triggers_on_keyboard_key() {
+        let mut h = Harness::new();
+        // KEY_RIGHTSHIFT = 54 press, then KEY_ESC = 1 press.
+        assert!(!h.feed(EV_KEY, 54, 1, false, false));
+        assert!(h.feed(EV_KEY, 1, 1, false, false));
+    }
+
+    #[test]
+    fn motion_accumulates_until_syn() {
+        let mut h = Harness::new();
+        h.feed(EV_REL, REL_X, 3, false, false);
+        h.feed(EV_REL, REL_Y, -5, false, false);
+        assert_eq!(h.scheduler.queue_len(), 0);
+        h.feed(EV_SYN, SYN_REPORT, 0, false, false);
+        assert_eq!(h.scheduler.queue_len(), 1);
+        assert_eq!(h.accum.dx, 0);
+        assert_eq!(h.accum.dy, 0);
+    }
+
+    #[test]
+    fn hi_res_wheel_skips_low_res_duplicate() {
+        // Modern mouse emits both REL_WHEEL=1 and REL_WHEEL_HI_RES=120 in
+        // the same SYN frame. Only the hi-res value should feed the accum.
+        let mut h = Harness::new();
+        h.feed(EV_REL, REL_WHEEL_HI_RES, 120, true, false);
+        h.feed(EV_REL, REL_WHEEL, 1, true, false);
+        h.feed(EV_SYN, SYN_REPORT, 0, true, false);
+        assert_eq!(h.scheduler.queue_len(), 1);
+    }
+
+    #[test]
+    fn low_res_only_scales_to_v120() {
+        // Old mouse only emits REL_WHEEL; we scale ×120 into the accum.
+        let mut h = Harness::new();
+        h.feed(EV_REL, REL_WHEEL, 1, false, false);
+        h.feed(EV_SYN, SYN_REPORT, 0, false, false);
+        assert_eq!(h.scheduler.queue_len(), 1);
+    }
+
+    #[test]
+    fn natural_scrolling_inverts_vertical() {
+        let mut h = Harness::new().with_natural();
+        h.feed(EV_REL, REL_WHEEL_HI_RES, 120, true, false);
+        h.feed(EV_SYN, SYN_REPORT, 0, true, false);
+        let packets = h.scheduler.pop_due(1000);
+        assert_eq!(packets.len(), 1);
+        match packets[0].packet {
+            crate::event::InputPacket::Scroll { vert, horiz: _ } => assert_eq!(vert, -1),
+            _ => panic!("expected Scroll"),
+        }
+    }
+
+    #[test]
+    fn unknown_event_types_are_dropped() {
+        let mut h = Harness::new();
+        // EV_MSC = 0x04.
+        h.feed(0x04, 0x04, 123, false, false);
+        assert_eq!(h.scheduler.queue_len(), 0);
     }
 }

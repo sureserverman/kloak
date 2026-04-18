@@ -4,4 +4,4 @@ Maintainer: Server Man
 Architecture: amd64
 Description: Keystroke and mouse timing anonymization (uinput-based)
 Source: kloak-ubuntu
-Depends: libevdev2, libinput10
+Depends: libc6

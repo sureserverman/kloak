@@ -21,8 +21,9 @@ debian/tmp-man/
 debian/.debhelper/
 debian/kloak/
 debian/tmp/
-# arm64 cross-compile sysroot (built by rust/build-arm64-sysroot.sh)
-/rust/sysroot-arm64/
+# Rust build output
+/rust/target/
+/rust/target-*/
 
 # Project-convention deb build artifacts
 /deb/amd64/*
