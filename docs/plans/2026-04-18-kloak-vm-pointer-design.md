@@ -1,7 +1,7 @@
 # Design: VM-pointer ABS passthrough (Approach A1)
 
 **Date:** 2026-04-18
-**Status:** Approved for implementation
+**Status:** Implemented (commits 5b11c4f..1ed918a, VM smoke test 2026-04-18)
 **Scope:** Make kloak-ubuntu usable inside libvirt/VMM and UTM (macOS QEMU) guests, whose pointer device is an emulated absolute tablet that the current evdev filter rejects.
 
 ---
