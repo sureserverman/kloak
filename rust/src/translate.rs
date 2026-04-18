@@ -15,7 +15,12 @@
 //! - EV_REL REL_WHEEL/REL_HWHEEL → accumulated scroll, scaled ×120, only
 //!   when the device doesn't advertise a hi-res counterpart (avoids
 //!   double-counting).
-//! - EV_ABS — never reached; devices with ABS are filtered out at attach.
+//! - EV_ABS ABS_X/ABS_Y — accumulated from VM-tablet devices (QEMU USB
+//!   Tablet, virtio-tablet). On SYN_REPORT, normalized against the device's
+//!   `abs_x_max`/`abs_y_max` into the uinput sink's 0..=32767 output range
+//!   and enqueued as `InputPacket::AbsPos`. Other ABS codes (MT slots,
+//!   pressure, tilt) are dropped; real touchpads with ABS_MT_SLOT are
+//!   rejected at attach so they never reach this layer.
 //! - EV_MSC, EV_LED, EV_REP, … → dropped.
 
 use crate::escape::EscCombo;
@@ -27,6 +32,7 @@ use crate::scroll::drain_ticks;
 
 const EV_KEY: u16 = 0x01;
 const EV_REL: u16 = 0x02;
+const EV_ABS: u16 = 0x03;
 const EV_SYN: u16 = 0x00;
 
 const SYN_REPORT: u16 = 0x00;
@@ -37,6 +43,9 @@ const REL_HWHEEL: u16 = 0x06;
 const REL_WHEEL: u16 = 0x08;
 const REL_WHEEL_HI_RES: u16 = 0x0b;
 const REL_HWHEEL_HI_RES: u16 = 0x0c;
+
+const ABS_X: u16 = 0x00;
+const ABS_Y: u16 = 0x01;
 
 /// Lowest pointer-button code in `<linux/input-event-codes.h>`. Codes below
 /// this are keyboard keys; codes at or above are mouse/joystick buttons.
@@ -139,6 +148,13 @@ pub fn handle_raw_event(
             }
             _ => {}
         },
+        EV_ABS => match code {
+            ABS_X => accum.pending_abs_x = Some(value),
+            ABS_Y => accum.pending_abs_y = Some(value),
+            // ABS_MT_*, ABS_PRESSURE, ABS_TILT_* — dropped. Real touchpads
+            // with these axes are rejected at attach time.
+            _ => {}
+        },
         EV_SYN => {
             if code == SYN_REPORT {
                 flush_frame(accum, now, ctx);
@@ -155,7 +171,9 @@ pub fn handle_raw_event(
     false
 }
 
-/// Drain a SYN frame: enqueue motion if nonzero, enqueue scroll if nonzero.
+/// Drain a SYN frame: enqueue motion if nonzero, enqueue scroll if nonzero,
+/// enqueue absolute position if the device is a VM tablet and the frame
+/// carried an ABS_X or ABS_Y update.
 fn flush_frame(accum: &mut FrameAccum, now: i64, ctx: &mut TranslateCtx<'_>) {
     if accum.dx != 0 || accum.dy != 0 {
         ctx.scheduler
@@ -172,6 +190,17 @@ fn flush_frame(accum: &mut FrameAccum, now: i64, ctx: &mut TranslateCtx<'_>) {
             (vert, horiz)
         };
         ctx.scheduler.enqueue_scroll(now, ctx.rng, vert, horiz);
+    }
+    if let (Some(x_max), Some(y_max)) = (accum.abs_x_max, accum.abs_y_max) {
+        if accum.pending_abs_x.is_some() || accum.pending_abs_y.is_some() {
+            let raw_x = accum.pending_abs_x.unwrap_or(0).clamp(0, x_max);
+            let raw_y = accum.pending_abs_y.unwrap_or(0).clamp(0, y_max);
+            let x = (i64::from(raw_x) * 32767 / i64::from(x_max)) as i32;
+            let y = (i64::from(raw_y) * 32767 / i64::from(y_max)) as i32;
+            ctx.scheduler.enqueue_abs_pos(now, ctx.rng, x, y);
+            accum.pending_abs_x = None;
+            accum.pending_abs_y = None;
+        }
     }
 }
 
@@ -304,6 +333,70 @@ mod tests {
             crate::event::InputPacket::Scroll { vert, horiz: _ } => assert_eq!(vert, -1),
             _ => panic!("expected Scroll"),
         }
+    }
+
+    #[test]
+    fn abs_x_y_flush_on_syn_and_normalize() {
+        let mut h = Harness::new();
+        h.accum.abs_x_max = Some(1000);
+        h.accum.abs_y_max = Some(2000);
+        h.feed(EV_ABS, ABS_X, 500, false, false);
+        h.feed(EV_ABS, ABS_Y, 1000, false, false);
+        assert_eq!(h.scheduler.queue_len(), 0);
+        h.feed(EV_SYN, SYN_REPORT, 0, false, false);
+
+        let pkts = h.scheduler.pop_due(1_000_000);
+        assert_eq!(pkts.len(), 1);
+        match pkts[0].packet {
+            crate::event::InputPacket::AbsPos { x, y } => {
+                // 500/1000 * 32767 = 16383; 1000/2000 * 32767 = 16383.
+                assert_eq!(x, 16383);
+                assert_eq!(y, 16383);
+            }
+            _ => panic!("expected AbsPos"),
+        }
+        assert!(h.accum.pending_abs_x.is_none());
+        assert!(h.accum.pending_abs_y.is_none());
+    }
+
+    #[test]
+    fn abs_without_max_is_dropped() {
+        // abs_x_max/abs_y_max None → not a VM tablet; any EV_ABS stays
+        // buffered but never flushed (defensive — real touchpads are already
+        // filtered at attach so this path shouldn't trigger in practice).
+        let mut h = Harness::new();
+        h.feed(EV_ABS, ABS_X, 500, false, false);
+        h.feed(EV_SYN, SYN_REPORT, 0, false, false);
+        assert_eq!(h.scheduler.queue_len(), 0);
+    }
+
+    #[test]
+    fn abs_normalization_clamps_out_of_range() {
+        let mut h = Harness::new();
+        h.accum.abs_x_max = Some(1000);
+        h.accum.abs_y_max = Some(1000);
+        h.feed(EV_ABS, ABS_X, 1500, false, false);
+        h.feed(EV_ABS, ABS_Y, -10, false, false);
+        h.feed(EV_SYN, SYN_REPORT, 0, false, false);
+        let pkts = h.scheduler.pop_due(1_000_000);
+        match pkts[0].packet {
+            crate::event::InputPacket::AbsPos { x, y } => {
+                assert_eq!(x, 32767);
+                assert_eq!(y, 0);
+            }
+            _ => panic!("expected AbsPos"),
+        }
+    }
+
+    #[test]
+    fn abs_mt_slot_is_dropped() {
+        // ABS_MT_SLOT = 0x2f. Should be silently ignored by translate.
+        let mut h = Harness::new();
+        h.accum.abs_x_max = Some(1000);
+        h.accum.abs_y_max = Some(1000);
+        h.feed(EV_ABS, 0x2f, 5, false, false);
+        h.feed(EV_SYN, SYN_REPORT, 0, false, false);
+        assert_eq!(h.scheduler.queue_len(), 0);
     }
 
     #[test]
