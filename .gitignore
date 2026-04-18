@@ -1,4 +1,5 @@
 /c/kloak
+/c/uinput-smoke
 eventcap
 cmake-build-debug/
 .idea/
