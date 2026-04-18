@@ -127,9 +127,6 @@ clean :
 	rm -f kloak
 	rm -f src/xdg-shell-protocol.h src/xdg-shell-protocol.c src/xdg-output-protocol.h src/xdg-output-protocol.c src/wlr-layer-shell.h src/wlr-layer-shell.c src/wlr-virtual-pointer.h src/wlr-virtual-pointer.c src/virtual-keyboard.h src/virtual-keyboard.c
 	rm -f auto-generated-man-pages/kloak.8
-	rm -f $(DEB_DIR)/amd64/$(BINARY)
-	rm -f $(DEB_DIR)/arm64/$(BINARY)
-	rm -f $(PKG_MAN)
 
 install : all etc/apparmor.d/usr.bin.kloak $(MANPAGES)
 	$(INSTALL) -d -m 755 $(addprefix $(DESTDIR), $(bindir) $(mandir)/man8 $(apparmor_dir))
@@ -145,6 +142,7 @@ PKG_MAN := $(DEB_DIR)/package/usr/share/man/man8/$(BINARY).8.gz
 .PHONY: x86_64 aarch64 bootstrap
 
 x86_64:
+	$(MAKE) clean
 	$(MAKE) all
 	$(MAKE) man
 	mkdir -p $(DEB_DIR)/amd64 $(dir $(PKG_MAN))
@@ -152,32 +150,32 @@ x86_64:
 	install -m 0644 auto-generated-man-pages/$(BINARY).8 $(dir $(PKG_MAN))$(BINARY).8
 	gzip -9 -n -f $(dir $(PKG_MAN))$(BINARY).8
 
+SYSROOT_ARM64 := $(CURDIR)/sysroot-arm64/root
+
 aarch64:
 	@command -v aarch64-linux-gnu-gcc >/dev/null 2>&1 || { \
 	  echo "ERROR: aarch64-linux-gnu-gcc not found. Run: make -C c bootstrap"; \
 	  exit 1; \
 	}
-	@test -f /usr/lib/aarch64-linux-gnu/pkgconfig/libinput.pc || { \
-	  echo "ERROR: arm64 dev libs missing (no /usr/lib/aarch64-linux-gnu/pkgconfig/libinput.pc)."; \
-	  echo "Run: make -C c bootstrap"; \
-	  exit 1; \
-	}
+	@test -f $(SYSROOT_ARM64)/usr/lib/aarch64-linux-gnu/pkgconfig/libinput.pc || \
+	    $(CURDIR)/build-arm64-sysroot.sh
 	$(MAKE) clean
 	$(MAKE) all \
 	    CC=aarch64-linux-gnu-gcc \
 	    PKG_CONFIG=pkg-config \
-	    PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig \
-	    PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig \
-	    PKG_CONFIG_SYSROOT_DIR=/
+	    PKG_CONFIG_PATH= \
+	    PKG_CONFIG_LIBDIR=$(SYSROOT_ARM64)/usr/lib/aarch64-linux-gnu/pkgconfig:$(SYSROOT_ARM64)/usr/share/pkgconfig \
+	    PKG_CONFIG_SYSROOT_DIR=$(SYSROOT_ARM64) \
+	    LDFLAGS='-L$(SYSROOT_ARM64)/usr/lib/aarch64-linux-gnu -L$(SYSROOT_ARM64)/lib/aarch64-linux-gnu -Wl,-rpath-link,$(SYSROOT_ARM64)/usr/lib/aarch64-linux-gnu -Wl,-rpath-link,$(SYSROOT_ARM64)/lib/aarch64-linux-gnu -Wl,--allow-shlib-undefined'
 	mkdir -p $(DEB_DIR)/arm64
 	install -m 0755 $(BINARY) $(DEB_DIR)/arm64/$(BINARY)
 
+# Self-contained bootstrap: install host-side cross toolchain (amd64 packages
+# only — no `dpkg --add-architecture`, no system arm64 apt sources). The arm64
+# dev libraries are fetched from ports.ubuntu.com into a project-local sysroot
+# by build-arm64-sysroot.sh, invoked automatically by the aarch64 target.
 bootstrap:
-	sudo dpkg --add-architecture arm64
-	sudo apt-get update
 	sudo apt-get install -y \
 	    build-essential libevdev-dev libinput-dev libwayland-dev \
 	    libxkbcommon-dev libwayland-bin pkg-config ronn \
-	    crossbuild-essential-arm64 \
-	    libevdev-dev:arm64 libinput-dev:arm64 libwayland-dev:arm64 \
-	    libxkbcommon-dev:arm64
+	    crossbuild-essential-arm64

@@ -29,6 +29,9 @@ c/src/wlr-virtual-pointer.[ch]
 c/src/virtual-keyboard.[ch]
 c/auto-generated-man-pages/kloak.8
 
+# arm64 cross-compile sysroot (built by c/build-arm64-sysroot.sh)
+/c/sysroot-arm64/
+
 # Project-convention deb build artifacts
 /deb/amd64/*
 !/deb/amd64/.gitkeep
