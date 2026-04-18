@@ -56,6 +56,33 @@ const BUS_VIRTUAL: u16 = 0x06;
 
 const UINPUT_MAX_NAME_SIZE: usize = 80;
 
+/// `INPUT_PROP_POINTER`: tells udev this is a mouse-style pointer, not a
+/// drawing tablet. Without this, advertising EV_ABS + ABS_X/Y causes GNOME
+/// Shell to tag the virtual device `ID_INPUT_TABLET` (the exact bug the
+/// old C daemon hit). With the flag set, udev tags it `ID_INPUT_MOUSE`
+/// and compositors map it to a pointer, which is what QEMU USB Tablet
+/// and virtio-tablet need.
+const INPUT_PROP_POINTER: u16 = 0x00;
+
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+struct InputAbsinfo {
+    value: i32,
+    minimum: i32,
+    maximum: i32,
+    fuzz: i32,
+    flat: i32,
+    resolution: i32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct UinputAbsSetup {
+    code: u16,
+    _pad: u16,
+    absinfo: InputAbsinfo,
+}
+
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct InputId {
@@ -107,7 +134,10 @@ const UI_DEV_SETUP: u32 = iow(UINPUT_IOCTL_BASE, 3, size_of::<UinputSetup>() as 
 const UI_SET_EVBIT: u32 = iow(UINPUT_IOCTL_BASE, 100, size_of::<c_int>() as u32);
 const UI_SET_KEYBIT: u32 = iow(UINPUT_IOCTL_BASE, 101, size_of::<c_int>() as u32);
 const UI_SET_RELBIT: u32 = iow(UINPUT_IOCTL_BASE, 102, size_of::<c_int>() as u32);
+const UI_SET_ABSBIT: u32 = iow(UINPUT_IOCTL_BASE, 103, size_of::<c_int>() as u32);
 const UI_SET_MSCBIT: u32 = iow(UINPUT_IOCTL_BASE, 104, size_of::<c_int>() as u32);
+const UI_SET_PROPBIT: u32 = iow(UINPUT_IOCTL_BASE, 110, size_of::<c_int>() as u32);
+const UI_ABS_SETUP: u32 = iow(UINPUT_IOCTL_BASE, 4, size_of::<UinputAbsSetup>() as u32);
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -135,13 +165,15 @@ impl UInput {
         set_evbit(fd, EV_SYN)?;
         set_evbit(fd, EV_KEY)?;
         set_evbit(fd, EV_REL)?;
-        // EV_ABS and UI_ABS_SETUP are deliberately NOT advertised. Kloak never
-        // emits ABS events — the axes were declared in the C daemon for parity
-        // with historical input stacks, but doing so causes udev to tag the
-        // device with ID_INPUT_TABLET + ID_INPUT_WIDTH_MM=65535, which confuses
-        // compositors that rely on absolute-tablet positioning (notably GNOME
-        // Shell inside VMMs that use a spice/QEMU USB tablet for cursor sync).
+        set_evbit(fd, EV_ABS)?;
         set_evbit(fd, EV_MSC)?;
+
+        // INPUT_PROP_POINTER must be set BEFORE UI_DEV_CREATE. Without it,
+        // advertising EV_ABS + ABS_X/Y causes udev to tag the virtual device
+        // `ID_INPUT_TABLET` and GNOME Shell treats it as a drawing tablet —
+        // the exact bug the old C daemon hit. With the flag, udev tags it
+        // `ID_INPUT_MOUSE` and compositors map it to a pointer.
+        ioctl_int(fd, UI_SET_PROPBIT, c_int::from(INPUT_PROP_POINTER))?;
 
         // Advertise every KEY_ / BTN_ code. Matches C behavior — libinput
         // will only deliver codes that exist on real devices, so
@@ -156,6 +188,14 @@ impl UInput {
         set_relbit(fd, REL_HWHEEL)?;
         set_relbit(fd, REL_WHEEL_HI_RES)?;
         set_relbit(fd, REL_HWHEEL_HI_RES)?;
+
+        // Absolute axes for the VM-tablet passthrough path. Range 0..32767
+        // matches what translate.rs normalizes raw per-device values into,
+        // independent of each source device's own max.
+        set_absbit(fd, ABS_X)?;
+        set_absbit(fd, ABS_Y)?;
+        abs_setup(fd, ABS_X, 0, 32767)?;
+        abs_setup(fd, ABS_Y, 0, 32767)?;
 
         set_mscbit(fd, MSC_SCAN)?;
 
@@ -273,6 +313,33 @@ fn set_mscbit(fd: RawFd, code: u16) -> io::Result<()> {
     ioctl_int(fd, UI_SET_MSCBIT, c_int::from(code))
 }
 
+fn set_absbit(fd: RawFd, code: u16) -> io::Result<()> {
+    ioctl_int(fd, UI_SET_ABSBIT, c_int::from(code))
+}
+
+fn abs_setup(fd: RawFd, code: u16, min: i32, max: i32) -> io::Result<()> {
+    let setup = UinputAbsSetup {
+        code,
+        _pad: 0,
+        absinfo: InputAbsinfo {
+            value: 0,
+            minimum: min,
+            maximum: max,
+            fuzz: 0,
+            flat: 0,
+            resolution: 0,
+        },
+    };
+    // SAFETY: UI_ABS_SETUP reads exactly size_of::<UinputAbsSetup>() bytes
+    // from the pointer; `setup` is fully initialized.
+    let rc = unsafe { libc::ioctl(fd, UI_ABS_SETUP as _, &setup as *const UinputAbsSetup) };
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 fn dev_setup(fd: RawFd) -> io::Result<()> {
     let mut name = [0u8; UINPUT_MAX_NAME_SIZE];
     let label = b"kloak";
@@ -322,7 +389,17 @@ mod tests {
         assert_eq!(UI_SET_EVBIT, 0x40045564);
         assert_eq!(UI_SET_KEYBIT, 0x40045565);
         assert_eq!(UI_SET_RELBIT, 0x40045566);
+        assert_eq!(UI_SET_ABSBIT, 0x40045567);
         assert_eq!(UI_SET_MSCBIT, 0x40045568);
+        assert_eq!(UI_SET_PROPBIT, 0x4004556e);
+        // UI_ABS_SETUP = _IOW('U', 4, struct uinput_abs_setup(28 bytes)).
+        assert_eq!(UI_ABS_SETUP, 0x401c5504);
+    }
+
+    #[test]
+    fn uinput_abs_setup_layout() {
+        // struct uinput_abs_setup = __u16 code + 2 bytes pad + input_absinfo(24) = 28.
+        assert_eq!(size_of::<UinputAbsSetup>(), 28);
     }
 
     #[test]

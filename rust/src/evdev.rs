@@ -107,8 +107,12 @@ pub struct InputAbsinfo {
 
 /// `EVIOCGABS(abs) = _IOR('E', 0x40 + abs, struct input_absinfo)`.
 const fn eviocgabs(abs: u8) -> libc::c_ulong {
-    ioc(IOC_READ, b'E', 0x40u16 + abs as u16, size_of::<InputAbsinfo>() as u32)
-        as libc::c_ulong
+    ioc(
+        IOC_READ,
+        b'E',
+        0x40u16 + abs as u16,
+        size_of::<InputAbsinfo>() as u32,
+    ) as libc::c_ulong
 }
 
 fn query_absinfo(fd: RawFd, abs: u8) -> io::Result<InputAbsinfo> {
