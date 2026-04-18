@@ -6,7 +6,8 @@ Description=kloak anti keystroke deanonymization tool
 Documentation=https://github.com/Whonix/kloak
 Documentation=man:kloak(8)
 ConditionPathExists=!/run/qubes/this-is-templatevm
-After=graphical.target
+ConditionPathExists=/dev/uinput
+After=multi-user.target
 After=sysmaint-boot.target
 
 [Service]
@@ -29,9 +30,6 @@ Type=simple
 ## For Qubes, see Qubes Event Buffering instead.
 ## https://www.whonix.org/wiki/Keystroke_and_Mouse_Deanonymization#Qubes_Event_Buffering
 
-## find_wl_compositor.py generates /run/kloak_wl_compositor_data.
-ExecStartPre=+-/usr/libexec/kloak/find_wl_compositor
-EnvironmentFile=-/run/kloak_wl_compositor_data
 ExecStart=/usr/bin/kloak
 
 Restart=always
@@ -56,7 +54,12 @@ NoNewPrivileges=true
 RestrictRealtime=true
 RestrictNamespaces=true
 SystemCallArchitectures=native
-SystemCallFilter=brk open poll close ioctl mmap munmap read pread64 getdents64 socket connect getsockopt epoll_create1 epoll_ctl rt_sigprocmask epoll_wait inotify_init1 access openat fstat prctl sendmsg recvmsg newfstatat unlink ftruncate fcntl timerfd_create statx readlinkat faccessat2 fstatfs inotify_add_watch timerfd_settime madvise sigaltstack rt_sigaction
+## uinput-based sink needs write(), exit_group, rt_sigreturn, clock_gettime,
+## getrandom, mprotect, and the libinput udev netlink + epoll plumbing.
+## The allowlist below was tuned for the old Wayland socket path and is no
+## longer correct; a re-tune with strace on real hardware is TODO. Leaving
+## the filter commented out rather than shipping a broken one.
+## SystemCallFilter=...
 
 [Install]
 WantedBy=graphical.target

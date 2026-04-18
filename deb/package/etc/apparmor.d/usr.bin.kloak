@@ -7,7 +7,6 @@ include <tunables/global>
 /usr/bin/kloak {
   include <local/usr.bin.kloak>
 
-  network unix stream,
   network netlink raw,
 
   signal receive set=cont peer=unconfined,
@@ -24,6 +23,7 @@ include <tunables/global>
   /{,usr/}lib{,32,64}/** mr,
   /dev/input/ r,
   /dev/input/event* rw,
+  /dev/uinput rw,
   /dev/console r,
   /dev/urandom r,
   /dev/shm/* mrw,
@@ -31,8 +31,6 @@ include <tunables/global>
   /dev/null rw,
   /sys/devices/**/uevent r,
   /run/udev/data/* r,
-  /run/user/*/ r,
-  /run/user/*/wayland-* r,
 
   /proc/* r,
   /proc/** r,

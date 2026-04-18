@@ -2,6 +2,6 @@ Package: kloak
 Version: 0.7.5
 Maintainer: Server Man
 Architecture: amd64
-Description: Keystroke and mouse timing anonymization for Wayland
+Description: Keystroke and mouse timing anonymization (uinput-based)
 Source: kloak-ubuntu
-Depends: libevdev2, libinput10, libwayland-client0, libxkbcommon0
+Depends: libevdev2, libinput10

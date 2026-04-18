@@ -3,7 +3,6 @@ set -e
 
 if command -v apparmor_parser >/dev/null 2>&1 && [ -d /etc/apparmor.d ]; then
     apparmor_parser -r /etc/apparmor.d/usr.bin.kloak 2>/dev/null || true
-    apparmor_parser -r /etc/apparmor.d/usr.libexec.kloak.find_wl_compositor 2>/dev/null || true
 fi
 
 systemctl daemon-reload || true

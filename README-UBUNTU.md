@@ -2,8 +2,10 @@
 
 Ubuntu / Debian `.deb` build of [Whonix/kloak](https://github.com/Whonix/kloak)
 — a keystroke and mouse-movement anonymizer that defends against keystroke
-biometric profiling by randomizing input event timing. **Wayland-only**: under
-X11 it loads but does nothing useful.
+biometric profiling by randomizing input event timing. This fork re-injects
+events through the kernel's `/dev/uinput` instead of upstream's wlroots
+virtual-pointer/virtual-keyboard Wayland protocols, so it works under GNOME
+Mutter, KDE KWin, wlroots compositors, and Xorg alike.
 
 This fork repackages upstream into the multi-project deb pipeline used across
 `~/dev/*`, adds a self-contained arm64 cross-build path that requires no
@@ -37,8 +39,7 @@ and how the pieces fit together.
 ```
 kloak-ubuntu/
 ├── c/                              language-scoped source + Makefile
-│   ├── src/                        upstream C source
-│   ├── protocol/                   upstream Wayland protocol XML
+│   ├── src/                        C source (kloak.c + uinput.[ch])
 │   ├── man/                        ronn man-page source
 │   ├── Makefile                    upstream make rules + publish-toolkit
 │   │                               targets (x86_64, aarch64, bootstrap)
@@ -54,7 +55,6 @@ kloak-ubuntu/
 │       ├── etc/apparmor.d/         apparmor profiles
 │       └── usr/
 │           ├── bin/kloak           (build output, gitignored)
-│           ├── libexec/kloak/find_wl_compositor
 │           ├── lib/systemd/system/kloak.service
 │           └── share/man/man8/kloak.8.gz   (build output, gitignored)
 │
@@ -117,9 +117,8 @@ This project sidesteps that completely. The flow is:
 
 **One-time** — `make -C c bootstrap` installs only host-side packages:
 
-- `build-essential`, `pkg-config`, `ronn`, `libwayland-bin`
-- amd64 dev libs for the host build (`libevdev-dev`, `libinput-dev`,
-  `libwayland-dev`, `libxkbcommon-dev`)
+- `build-essential`, `pkg-config`, `ronn`
+- amd64 dev libs for the host build (`libevdev-dev`, `libinput-dev`)
 - `crossbuild-essential-arm64` (the cross-toolchain — installed as amd64,
   contains the aarch64 GCC and bundled cross-libc under
   `/usr/aarch64-linux-gnu/`)
@@ -132,8 +131,7 @@ automatically:
 
 1. Downloads `Packages.gz` indexes from `ports.ubuntu.com` for
    `noble{,-updates,-security}` × `{main,universe}` via plain `curl`.
-2. Resolves the dependency closure of `libevdev-dev`, `libinput-dev`,
-   `libwayland-dev`, `libxkbcommon-dev`.
+2. Resolves the dependency closure of `libevdev-dev`, `libinput-dev`.
 3. Excludes packages provided by the cross-toolchain (libc, libgcc,
    libstdc++) and large unused transitives (python, glib, openssl).
 4. Fetches each `.deb` directly from `ports.ubuntu.com` via `curl`.
@@ -170,16 +168,18 @@ sudo apt install ./kloak_0.7.5_amd64.deb       # or ..._arm64.deb
 sudo systemctl enable --now kloak
 ```
 
-Verify the daemon is running and attached to a Wayland compositor:
+Verify the daemon is running:
 
 ```bash
 systemctl status kloak
 journalctl -u kloak -f
 ```
 
-The systemd unit calls `/usr/libexec/kloak/find_wl_compositor` at startup
-to locate the active Wayland session. Under X11 this returns nothing and
-the service is a no-op.
+kloak grabs `/dev/input/event*` keyboards and mice, runs every event
+through a randomized-delay buffer, and re-emits the buffered stream via
+`/dev/uinput`. This is compositor-agnostic — it works under GNOME Mutter,
+KDE KWin, wlroots compositors, and Xorg. The service requires
+`CAP_SYS_ADMIN` (for `EVIOCGRAB`) and access to `/dev/uinput`.
 
 ---
 
@@ -205,11 +205,10 @@ Upstream is `https://github.com/Whonix/kloak`. Run:
   | upstream path                 | action                            | local destination                              |
   |-------------------------------|-----------------------------------|------------------------------------------------|
   | `src/`                        | copy via `git show`               | `c/src/`                                       |
-  | `protocol/`                   | copy via `git show`               | `c/protocol/`                                  |
   | `man/`                        | copy via `git show`               | `c/man/`                                       |
   | `etc/apparmor.d/`             | copy via `git show`               | `deb/package/etc/apparmor.d/`                  |
   | `usr/lib/systemd/system/`     | copy via `git show`               | `deb/package/usr/lib/systemd/system/`          |
-  | `usr/libexec/kloak/`          | copy via `git show`               | `deb/package/usr/libexec/kloak/`               |
+  | `protocol/`, `usr/libexec/`   | skipped — Wayland-only, unused    | (not written — this fork uses `/dev/uinput`)   |
   | `Makefile`                    | 3-way merge (`git merge-file`)    | `c/Makefile`                                   |
   | `debian/changelog`            | print head 15 lines for reference | (not written — manual mirror to `control`)     |
   | everything else               | listed as ignored                 | (not touched)                                  |

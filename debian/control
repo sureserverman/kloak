@@ -10,8 +10,6 @@ Build-Depends: debhelper (>= 13.11.4),
  dh-apparmor,
  libevdev-dev,
  libinput-dev,
- libwayland-dev,
- libxkbcommon-dev,
  pkgconf,
  ronn
 Homepage: https://github.com/vmonaco/kloak
@@ -38,7 +36,7 @@ Package: kloak
 ## qemu:handle_cpu_signal received signal outside vCPU context @ pc=0x6000178c
 ## Update: Same as above.
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}, python3
+Depends: ${shlibs:Depends}, ${misc:Depends}
 Description: privacy tool for anonymizing keyboard and mouse use
  A keystroke and mouse-level online anonymization kernel.
  A tool to prevent tracking through keyboard and mouse input.
@@ -57,7 +55,8 @@ Description: privacy tool for anonymizing keyboard and mouse use
  movements, and modifies the mouse pointer path. This helps prevent
  mouse biometrics from revealing identity.
  .
- kloak is designed for use only with the Wayland display server.
+ kloak re-injects events through the kernel's /dev/uinput, so it works
+ under any graphical stack (GNOME Mutter, KDE KWin, wlroots, Xorg).
  .
  https://www.whonix.org/wiki/Keystroke_and_Mouse_Deanonymization#Kloak
  .
