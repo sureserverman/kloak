@@ -23,11 +23,6 @@ debian/tmp-man/
 debian/.debhelper/
 debian/kloak/
 debian/tmp/
-c/src/xdg-shell-protocol.[ch]
-c/src/xdg-output-protocol.[ch]
-c/src/wlr-layer-shell.[ch]
-c/src/wlr-virtual-pointer.[ch]
-c/src/virtual-keyboard.[ch]
 c/auto-generated-man-pages/kloak.8
 
 # arm64 cross-compile sysroot (built by c/build-arm64-sysroot.sh)

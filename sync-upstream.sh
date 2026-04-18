@@ -1,9 +1,12 @@
 #!/bin/bash
 # Selectively pull upstream Whonix/kloak changes into our restructured layout.
 #
-# Upstream lays files at the repo root (src/, protocol/, man/, Makefile,
-# etc/apparmor.d/, usr/lib/systemd/system/, usr/libexec/kloak/, debian/...).
+# Upstream lays files at the repo root (src/, man/, Makefile,
+# etc/apparmor.d/, usr/lib/systemd/system/, debian/...).
 # Our fork stages source under c/ and packaging assets under deb/package/.
+# Upstream's Wayland-specific files (protocol/, usr/libexec/kloak/) are not
+# synced: we re-inject input via /dev/uinput instead of wlroots protocols,
+# so the compositor-finder helper and protocol XMLs don't exist in our tree.
 # This script copies only the subset we use into the right local destination.
 #
 # Usage:
@@ -25,11 +28,9 @@ SYNC_FILE=".upstream-sync"
 # upstream path  ->  local destination
 declare -A MAP=(
   [src]="c/src"
-  [protocol]="c/protocol"
   [man]="c/man"
   [etc/apparmor.d]="deb/package/etc/apparmor.d"
   [usr/lib/systemd/system]="deb/package/usr/lib/systemd/system"
-  [usr/libexec/kloak]="deb/package/usr/libexec/kloak"
 )
 
 # Files that have local additions and need a real 3-way merge (upstream:local).

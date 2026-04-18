@@ -84,40 +84,10 @@ all : kloak
 uinput-smoke : src/uinput_smoke.c src/uinput.c src/uinput.h
 	$(CC) -Wall -Wextra -O2 -g -Isrc src/uinput_smoke.c src/uinput.c -o uinput-smoke
 
-kloak : src/kloak.c src/kloak.h src/xdg-shell-protocol.h src/xdg-shell-protocol.c src/xdg-output-protocol.h src/xdg-output-protocol.c src/wlr-layer-shell.c src/wlr-layer-shell.h src/wlr-virtual-pointer.c src/wlr-virtual-pointer.h src/virtual-keyboard.c src/virtual-keyboard.h
+kloak : src/kloak.c src/uinput.c src/uinput.h
 	## Comment out the below line and uncomment the line after it to do a test build with -fanalyzer
-	$(CC) -g src/kloak.c src/xdg-shell-protocol.c src/xdg-output-protocol.c src/wlr-layer-shell.c src/wlr-virtual-pointer.c src/virtual-keyboard.c -o kloak -lm -lrt $(shell $(PKG_CONFIG) --cflags --libs libinput) $(shell $(PKG_CONFIG) --cflags --libs libevdev) $(shell $(PKG_CONFIG) --cflags --libs wayland-client) $(shell $(PKG_CONFIG) --cflags --libs xkbcommon) $(CFLAGS) $(LDFLAGS)
-	#$(CC) -g src/kloak.c src/xdg-shell-protocol.c src/xdg-output-protocol.c src/wlr-layer-shell.c src/wlr-virtual-pointer.c src/virtual-keyboard.c -o kloak -lm -lrt $(shell $(PKG_CONFIG) --cflags --libs libinput) $(shell $(PKG_CONFIG) --cflags --libs libevdev) $(shell $(PKG_CONFIG) --cflags --libs wayland-client) $(shell $(PKG_CONFIG) --cflags --libs xkbcommon) -fanalyzer
-
-src/xdg-shell-protocol.h : protocol/xdg-shell.xml
-	wayland-scanner client-header < protocol/xdg-shell.xml > src/xdg-shell-protocol.h
-
-src/xdg-shell-protocol.c : protocol/xdg-shell.xml
-	wayland-scanner private-code < protocol/xdg-shell.xml > src/xdg-shell-protocol.c
-
-src/xdg-output-protocol.h : protocol/xdg-output-unstable-v1.xml
-	wayland-scanner client-header < protocol/xdg-output-unstable-v1.xml > src/xdg-output-protocol.h
-
-src/xdg-output-protocol.c : protocol/xdg-output-unstable-v1.xml
-	wayland-scanner private-code < protocol/xdg-output-unstable-v1.xml > src/xdg-output-protocol.c
-
-src/wlr-layer-shell.h : protocol/wlr-layer-shell-unstable-v1.xml
-	wayland-scanner client-header < protocol/wlr-layer-shell-unstable-v1.xml > src/wlr-layer-shell.h
-
-src/wlr-layer-shell.c : protocol/wlr-layer-shell-unstable-v1.xml
-	wayland-scanner private-code < protocol/wlr-layer-shell-unstable-v1.xml > src/wlr-layer-shell.c
-
-src/wlr-virtual-pointer.h : protocol/wlr-virtual-pointer-unstable-v1.xml
-	wayland-scanner client-header < protocol/wlr-virtual-pointer-unstable-v1.xml > src/wlr-virtual-pointer.h
-
-src/wlr-virtual-pointer.c : protocol/wlr-virtual-pointer-unstable-v1.xml
-	wayland-scanner private-code < protocol/wlr-virtual-pointer-unstable-v1.xml > src/wlr-virtual-pointer.c
-
-src/virtual-keyboard.h : protocol/virtual-keyboard-unstable-v1.xml
-	wayland-scanner client-header < protocol/virtual-keyboard-unstable-v1.xml > src/virtual-keyboard.h
-
-src/virtual-keyboard.c : protocol/virtual-keyboard-unstable-v1.xml
-	wayland-scanner private-code < protocol/virtual-keyboard-unstable-v1.xml > src/virtual-keyboard.c
+	$(CC) -g src/kloak.c src/uinput.c -o kloak -lm -lrt $(shell $(PKG_CONFIG) --cflags --libs libinput) $(shell $(PKG_CONFIG) --cflags --libs libevdev) $(CFLAGS) $(LDFLAGS)
+	#$(CC) -g src/kloak.c src/uinput.c -o kloak -lm -lrt $(shell $(PKG_CONFIG) --cflags --libs libinput) $(shell $(PKG_CONFIG) --cflags --libs libevdev) -fanalyzer
 
 MANPAGES := auto-generated-man-pages/kloak.8
 
@@ -128,8 +98,7 @@ auto-generated-man-pages/% : man/%.ronn
 	ronn --manual="kloak Manual" --organization="kloak" <$< >$@
 
 clean :
-	rm -f kloak
-	rm -f src/xdg-shell-protocol.h src/xdg-shell-protocol.c src/xdg-output-protocol.h src/xdg-output-protocol.c src/wlr-layer-shell.h src/wlr-layer-shell.c src/wlr-virtual-pointer.h src/wlr-virtual-pointer.c src/virtual-keyboard.h src/virtual-keyboard.c
+	rm -f kloak uinput-smoke
 	rm -f auto-generated-man-pages/kloak.8
 
 install : all etc/apparmor.d/usr.bin.kloak $(MANPAGES)
@@ -180,6 +149,5 @@ aarch64:
 # by build-arm64-sysroot.sh, invoked automatically by the aarch64 target.
 bootstrap:
 	sudo apt-get install -y \
-	    build-essential libevdev-dev libinput-dev libwayland-dev \
-	    libxkbcommon-dev libwayland-bin pkg-config ronn \
+	    build-essential libevdev-dev libinput-dev pkg-config ronn \
 	    crossbuild-essential-arm64
