@@ -1,184 +1,230 @@
-# privacy tool for anonymizing keyboard and mouse use #
+# kloak for Ubuntu
 
-A keystroke and mouse-level online anonymization kernel.
-A tool to prevent tracking through keyboard and mouse input.
+Ubuntu / Debian `.deb` build of [Whonix/kloak](https://github.com/Whonix/kloak)
+— a keystroke and mouse-movement anonymizer that defends against keystroke
+biometric profiling by randomizing input event timing. This fork re-injects
+events through the kernel's `/dev/uinput` instead of upstream's wlroots
+virtual-pointer/virtual-keyboard Wayland protocols, so it works under GNOME
+Mutter, KDE KWin, wlroots compositors, and Xorg alike.
 
-Real-time anonymization for input devices like keyboards and mice,
-designed to counter tracking techniques.
+This fork repackages upstream into the multi-project deb pipeline used across
+`~/dev/*` and adds a self-contained arm64 cross-build path that requires no
+system-wide apt configuration.
 
-Helps protect your privacy by making it harder to identify you based on
-how you type or move your mouse.
+---
 
-For keyboards, it hides patterns by changing the timing between each key
-press and release. These patterns, known as keystroke biometrics, could
-otherwise be used to recognize individuals.
+## Quick start
 
-For mice, it introduces random changes to the timing and number of
-movements, and modifies the mouse pointer path. This helps prevent
-mouse biometrics from revealing identity.
+```bash
+# one-time host setup (cross-toolchain, build deps)
+make -C c bootstrap
 
-kloak is designed for use only with the Wayland display server.
+# build + publish both archs to the local reprepro repo + rsync to remote
+cd ~/dev/utils && ./publish kloak-ubuntu
 
-https://www.whonix.org/wiki/Keystroke_and_Mouse_Deanonymization#Kloak
-
-Technical details:
-
-* Obfuscates time intervals between keyboard input events.
-* Obfuscates time intervals, frequency, and pointer paths for mouse input.
-
-## Installation
-
-There are two ways to run kloak:
-
-  1. As an application
-  2. As a Linux service
-
-### As an application
-
-Install dependencies:
-
-Debian:
-
-    $ sudo apt install make libevdev2 libevdev-dev libinput10 libinput-dev libwayland-client0 libwayland-dev libudev1 libudev-dev libxkbcommon0 libxkbcommon-dev pkg-config
-
-Fedora:
-
-Unknown currently. Refer to Debian dependency list and install equivalent packages on Fedora.
-
-To compile `kloak`, simply run:
-
-    $ make all
-
-### As a service
-
-How to install `kloak` using apt-get
-
-1\. Download the APT Signing Key.
-
-```
-wget https://www.whonix.org/keys/derivative.asc
+# install the resulting .deb on a target machine
+sudo apt install ./kloak_0.7.5_amd64.deb
+sudo systemctl enable --now kloak
 ```
 
-Users can [check the Signing Key](https://www.whonix.org/wiki/Signing_Key) for better security.
+That's the entire flow. Everything below is detail on what those commands do
+and how the pieces fit together.
 
-2\. Add the APT Signing Key.
+---
 
-```
-sudo cp ~/derivative.asc /usr/share/keyrings/derivative.asc
-```
-
-3\. Add the derivative repository.
+## Repository layout
 
 ```
-echo "deb [signed-by=/usr/share/keyrings/derivative.asc] https://deb.whonix.org trixie main contrib non-free" | sudo tee /etc/apt/sources.list.d/derivative.list
+kloak-ubuntu/
+├── c/                              language-scoped source + Makefile
+│   ├── src/                        C source (kloak.c + uinput.[ch])
+│   ├── man/                        ronn man-page source
+│   ├── Makefile                    upstream make rules + publish-toolkit
+│   │                               targets (x86_64, aarch64, bootstrap)
+│   ├── build-arm64-sysroot.sh      fetches arm64 dev libs into a local
+│   │                               sysroot from ports.ubuntu.com
+│   └── sysroot-arm64/              (gitignored) arm64 cross-build sysroot
+│
+├── deb/                            publish-pipeline staging area
+│   ├── amd64/                      x86_64 binary staged here by `make x86_64`
+│   ├── arm64/                      aarch64 binary staged here by `make aarch64`
+│   └── package/                    skeleton .deb tree (committed)
+│       ├── DEBIAN/{control,postinst,prerm}
+│       ├── etc/apparmor.d/         apparmor profiles
+│       └── usr/
+│           ├── bin/kloak           (build output, gitignored)
+│           ├── lib/systemd/system/kloak.service
+│           └── share/man/man8/kloak.8.gz   (build output, gitignored)
+│
+├── debian/                         debhelper tree inherited from Whonix
+│                                   (parallel debuild flow — NOT used by
+│                                   `~/dev/utils/publish`; see below)
+│
+├── build.sh                        CodeQL autobuild entry point
+└── README.md                       this file
 ```
 
-4\. Update your package lists.
+The `c/` + `deb/{amd64,arm64,package}/` layout matches the convention shared
+by every other publishable-deb project under `~/dev/`. Rust projects use
+`rust/Makefile`; this is the C analog.
+
+---
+
+## Build & publish
+
+The build is driven by `~/dev/utils/publish`:
+
+```bash
+cd ~/dev/utils && ./publish kloak-ubuntu
+```
+
+What that does, end-to-end:
+
+1. Discovers `c/Makefile` (publish probes for `rust/Makefile` then `c/Makefile`).
+2. For each arch in `(amd64, arm64)`:
+   - Invokes `make -C c x86_64` or `make -C c aarch64`.
+   - That target clean-builds the binary, builds the man page (amd64 only),
+     and stages the output at `deb/<arch>/kloak`.
+3. Copies `deb/package/` to a temp dir, overlays the staged binary into
+   `usr/bin/kloak`, patches `Architecture:` in `DEBIAN/control`, and runs
+   `dpkg-deb --build`.
+4. For each distro listed in `~/dev/utils/distr.list`, runs
+   `reprepro includedeb` against `/var/www/repository/`.
+5. `rsync`s the entire repo tree to the remote host.
+
+For an amd64-only build with no cross-toolchain involvement:
+
+```bash
+make -C c x86_64           # produces deb/amd64/kloak
+```
+
+---
+
+## arm64 cross-compile (self-contained)
+
+The naive Debian/Ubuntu cross-build approach (`dpkg --add-architecture arm64`
++ apt-installing `:arm64` dev packages) requires modifying
+`/etc/apt/sources.list.d/ubuntu.sources` to route arm64 fetches to
+`ports.ubuntu.com`, which is intrusive system-wide configuration.
+
+This project sidesteps that completely. The flow is:
+
+**One-time** — `make -C c bootstrap` installs only host-side packages:
+
+- `build-essential`, `pkg-config`, `ronn`
+- amd64 dev libs for the host build (`libevdev-dev`, `libinput-dev`)
+- `crossbuild-essential-arm64` (the cross-toolchain — installed as amd64,
+  contains the aarch64 GCC and bundled cross-libc under
+  `/usr/aarch64-linux-gnu/`)
+
+No `dpkg --add-architecture`, no `:arm64` apt packages, no `/etc/apt/`
+edits, no foreign architecture registration.
+
+**On first `make -C c aarch64`** — `c/build-arm64-sysroot.sh` runs
+automatically:
+
+1. Downloads `Packages.gz` indexes from `ports.ubuntu.com` for
+   `noble{,-updates,-security}` × `{main,universe}` via plain `curl`.
+2. Resolves the dependency closure of `libevdev-dev`, `libinput-dev`.
+3. Excludes packages provided by the cross-toolchain (libc, libgcc,
+   libstdc++) and large unused transitives (python, glib, openssl).
+4. Fetches each `.deb` directly from `ports.ubuntu.com` via `curl`.
+5. Extracts everything with `dpkg-deb -x` into `c/sysroot-arm64/root/`.
+
+The Makefile's `aarch64` target then cross-compiles with:
 
 ```
-sudo apt-get update
+CC                     = aarch64-linux-gnu-gcc
+PKG_CONFIG_LIBDIR      = c/sysroot-arm64/root/usr/lib/aarch64-linux-gnu/pkgconfig:...
+PKG_CONFIG_SYSROOT_DIR = c/sysroot-arm64/root
+LDFLAGS               += -L<sysroot>/usr/lib/aarch64-linux-gnu
+                        -Wl,-rpath-link,<sysroot>/usr/lib/aarch64-linux-gnu
+                        -Wl,--allow-shlib-undefined
 ```
 
-5\. Install `kloak`.
+`--allow-shlib-undefined` lets the link complete despite glib symbols
+referenced via transitive `DT_NEEDED` (libwacom → glib, libgudev → glib);
+the dynamic loader resolves them at runtime on the real arm64 system.
 
+To rebuild the sysroot from scratch (e.g. after a noble point release):
+
+```bash
+rm -rf c/sysroot-arm64
+make -C c aarch64        # triggers build-arm64-sysroot.sh
 ```
-sudo apt-get install kloak
+
+---
+
+## Install
+
+```bash
+sudo apt install ./kloak_0.7.5_amd64.deb       # or ..._arm64.deb
+sudo systemctl enable --now kloak
 ```
 
-### How to build deb package
+Verify the daemon is running:
 
-See the [Whonix package build documentation](https://www.whonix.org/wiki/Dev/Build_Documentation/security-misc). Replace the sample package name `security-misc` with `kloak` to download, build, and install kloak.
+```bash
+systemctl status kloak
+journalctl -u kloak -f
+```
 
-## Usage
+kloak grabs `/dev/input/event*` keyboards and mice, runs every event
+through a randomized-delay buffer, and re-emits the buffered stream via
+`/dev/uinput`. This is compositor-agnostic — it works under GNOME Mutter,
+KDE KWin, wlroots compositors, and Xorg. The service requires
+`CAP_SYS_ADMIN` (for `EVIOCGRAB`) and access to `/dev/uinput`.
 
-Once `kloak` is compiled and installed, start it as root. This typically must run as root because `kloak` grabs exclusive access to input device files:
+---
 
-    $ sudo ./kloak
+## Two parallel packaging systems
 
-Then attempt to move the mouse. A red `+` sign should move around on the display. This is `kloak`'s mouse cursor. If you see this, `kloak` is running properly.
+This repo contains **both** packaging trees:
 
-You can use the keyboard the same way you usually would. Keystrokes will not appear immediately when typed, but will be delayed by semi-random amounts of time. This is what provides the anonymity benefits of kloak.
+|                 | `debian/` (upstream)                                      | `deb/` (this fork)                                    |
+|-----------------|-----------------------------------------------------------|-------------------------------------------------------|
+| Origin          | Inherited from Whonix                                     | Added by this fork                                    |
+| Build tool      | `debuild` / `dpkg-buildpackage` (debhelper)               | `dpkg-deb --build`, driven by `~/dev/utils/publish`   |
+| Driven by       | `debian/rules`                                            | `c/Makefile` + `~/dev/utils/publish`                  |
+| Output          | source `.dsc` + binary `.deb`s + `.changes`               | one binary `.deb` per arch                            |
+| Target          | upload to a Debian/Ubuntu archive                         | local `reprepro` repo, rsync'd to a private mirror    |
+| Used by publish | no                                                        | yes                                                   |
+| Build deps      | declared in `debian/control`, enforced by debhelper       | managed by `make -C c bootstrap`                      |
 
-The mouse can also be used the same as usual. When you move the mouse, only `kloak`'s mouse cursor will initially move; the operating system's cursor will "chase" it by jumping to `kloak`'s cursor's position at semi-random times. `kloak` will properly record where click events occur so that even if you click a location before the operating system's mouse cursor reaches that location, the click will register in the intended location.
+The `debian/` tree is left in place so the upstream debuild flow remains
+usable for anyone who wants it. The publish pipeline ignores it entirely.
 
-If `kloak` is installed as a service, you should see the red `+` mouse cursor upon startup. All input events will be anonymized automatically.
+---
 
-## Whonix contact and support
+## Maintenance reference
 
-* [Free Forum Support](https://forums.whonix.org)
-* [Professional Support](https://www.whonix.org/wiki/Professional_Support)
+| Task                                  | Command                                                      |
+|---------------------------------------|--------------------------------------------------------------|
+| Build amd64 only                      | `make -C c x86_64`                                           |
+| Build arm64 only                      | `make -C c aarch64`                                          |
+| Generate man page                     | `make -C c man`                                              |
+| Clean build artifacts                 | `make -C c clean`                                            |
+| Rebuild arm64 sysroot from scratch    | `rm -rf c/sysroot-arm64 && make -C c aarch64`                |
+| Full publish (both archs, all distros)| `cd ~/dev/utils && ./publish kloak-ubuntu`                   |
+| Bump version                          | edit `Version:` in `deb/package/DEBIAN/control`              |
 
-## Donate
+---
 
-`kloak` requires [donations](https://www.whonix.org/wiki/Donate) to stay alive!
+## Project conventions
 
-## Troubleshooting
+This project conforms to the multi-project deb-packaging convention used
+across `~/dev/*`. See `~/dev/utils/README.md` for the publish pipeline
+documentation. Briefly:
 
-### My keyboard or mouse seems very slow
-
-`kloak` works by introducing a random delay to each input event (key press, key release, mouse move, etc). This requires temporarily buffering the event before it reaches the application (e.g., a text editor).
-
-The maximum delay is specified with the -d option. This is the maximum delay (in milliseconds) that can occur between the physical input events and sending input events to the Wayland compositor. The default is 100 ms, which was shown to achieve about a 20-30% reduction in identification accuracy and doesn't create too much lag between the user and the application (see the paper below). As the maximum delay increases, the ability to obfuscate typing behavior also increases, and the responsiveness of the application decreases. This reflects a tradeoff between usability and privacy.
-
-If you're a fast typist and it seems like there is a long lag between pressing a key and seeing the character on screen, try lowering the maximum delay. Alternatively, if you're a slower typist, you might be able to increase the maximum delay without noticing much difference. Automatically determining the best lag for each typing speed is an item for future work.
-
-## Options
-
-The full usage and options are:
-
-    $ ./kloak --help
-
-    Usage: kloak [options]
-    Anonymizes keyboard and mouse input patterns by injecting jitter into input
-    events. Designed specifically for wlroots-based Wayland compositors. Will NOT
-    work with X11.
-
-    Options:
-      -h, --help
-        Print help.
-      -d, --delay=milliseconds
-        Configure the maximum delay of released events. Default is 100.
-      -s, --start-delay=milliseconds
-        Configure the time to wait before startup. Default is 500.
-      -c, --color=AARRGGBB
-        Configure the color to use for the virtual mouse cursor. Default is
-        00000000 (fully transparent black, i.e. invisible).
-      -n, --natural-scrolling=(true|false)
-        Enable or disable natural scrolling on supported pointing devices. Default
-        is false.
-      -k, --esc-key-combo=KEY_1[,KEY_2|KEY_3...]
-        Specify the key combination that will terminate kloak. Keys are separated
-        by commas. Keys can be aliased to each other by separating them with a
-        pipe (|) character. Default is KEY_RIGHTSHIFT,KEY_ESC.
-
-## Try it out
-
-See the [kloak defense testing](https://www.whonix.org/wiki/Keystroke_Deanonymization#Kloak) instructions.
-
-## Background
-
-`kloak` has two goals in mind:
-
-* Make it difficult for an adversary to identify a user
-* Make it difficult for an adversary to replicate a user's typing behavior
-
-The first goal can theoretically be achieved only if all users cooperate with each other to have the same typing behavior, for example by pressing keys with exactly the same frequency. Since different users type at different speeds, this is not practical. Instead, pseudo-anonymity is achieved by obfuscating a user's typing rhythm, making it difficult for an adversary to re-identify a single user.
-
-The second goal is to make it difficult for an adversary to forge typing behavior and impersonate a user, perhaps bypassing a two-factor authentication that uses keystroke biometrics. This is achieved by making the time between keystrokes unpredictable.
-
-For more info, see the paper [Obfuscating Keystroke Time Intervals to Avoid Identification and Impersonation](https://arxiv.org/pdf/1609.07612.pdf).
-
-### How it works
-
-The time between key press and release events are typically used to identify users by their typing behavior. The pattern of mouse movements and clicks can be used in a similar fashion. `kloak` obfuscates these time intervals and patterns by introducing a random delay between the physical input events and the arrival of input events at the application, for example a web browser. For mice, the number of input events is also obfuscated by combining many small mouse move events into a few mouse jumps. This also obfuscates the exact shape of the mouse movement path.
-
-kloak grabs the input device and sends delayed input events to the Wayland compositor using emulated input protocols. Grabbing the device disables any other application from reading the events. Events are scheduled to be released at a later time as they are received, and a semi-random delay is introduced before they are sent to the compositor.
-
-### When does it fail
-
-`kloak` does not protect against all forms of keystroke biometrics that can be used for identification. Specifically,
-
-* If the delay is too small, it is not effective. Adjust the delay to as high a value that's comfortable.
-* Repeated key presses are not obfuscated. If your system is set to repeat held-down keys at a unique rate, this could leak your identity. (TODO: Is this still the case, or are held-down keys obfuscated now?)
-* Writing style is still apparent, in which [stylometry techniques could be used to determine authorship](https://vmonaco.com/papers/An%20investigation%20of%20keystroke%20and%20stylometry%20traits%20for%20authenticating%20online%20test%20takers.pdf).
-* Higher-level cognitive behavior, such as editing and application usage, are still apparent. These lower-frequency actions are less understood at this point, but could potentially be used to reveal identity.
+- **Source under `<lang>/`** — rust projects use `rust/`, C projects use
+  `c/`. The Makefile lives there, not at repo root.
+- **`deb/package/` is the committed `.deb` skeleton** — DEBIAN control
+  files plus the filesystem mirror (`etc/`, `usr/lib/systemd/`,
+  `usr/libexec/`, etc.). Build outputs (`usr/bin/`, `usr/share/man/`)
+  are gitignored.
+- **`deb/<arch>/` holds per-arch staged binaries** — populated by the
+  Makefile's `x86_64` / `aarch64` targets, consumed by `publish` when
+  assembling the `.deb`.
+- **Every project supports both archs unless infeasible** — see the
+  arm64 cross-compile section above for how this project handles it
+  without polluting host system configuration.

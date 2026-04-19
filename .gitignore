@@ -33,3 +33,6 @@ debian/tmp/
 /deb/package/usr/bin/
 /deb/package/usr/share/man/
 /kloak_*_*.deb
+CLAUDE.md
+.claude/
+docs/plans/
