@@ -157,36 +157,29 @@ impl Scheduler {
 
     /// Enqueue an absolute-position packet (VM-tablet passthrough).
     ///
-    /// Unlike keystrokes/clicks/scroll, cursor position is NOT timing-
-    /// randomized: the scheduler uses `sched_time = now` so the packet
-    /// fires on the next tick, and consecutive AbsPos at the tail are
-    /// coalesced so only the latest cursor coordinate survives.
+    /// Timing is randomized via the same `[lower, max_delay]` jitter used
+    /// for keystrokes, clicks, and scroll. To keep the cursor monotonic
+    /// (never visibly stepping through stale intermediate points) we
+    /// coalesce: if the tail of the queue is an AbsPos still waiting to
+    /// fire, we overwrite its coordinates in place rather than appending
+    /// a new packet. The tail's `sched_time` is preserved, so the next
+    /// emission happens at the already-scheduled deadline with the latest
+    /// known position.
     ///
-    /// Rationale: per-sample random delay produces an erratic cursor
-    /// (samples emit in monotonic schedule order but with large inter-
-    /// sample gaps, so the cursor appears to "catch up" in bursts —
-    /// visually indistinguishable from jumping). Cursor position
-    /// already leaks far more information than its per-sample timing,
-    /// so the keystroke-timing anonymization goal is unaffected.
-    ///
-    /// `rng` is accepted for signature symmetry with the other enqueue
-    /// methods but unused.
-    pub fn enqueue_abs_pos(&mut self, now: i64, _rng: &mut dyn RandBetween, x: i32, y: i32) {
+    /// Net visual effect at high sample rates: the cursor updates at
+    /// roughly `max_delay`-bounded intervals instead of every sample,
+    /// with each update jumping directly to the current tablet position
+    /// (no perceived teleport, just lower effective sample rate).
+    pub fn enqueue_abs_pos(&mut self, now: i64, rng: &mut dyn RandBetween, x: i32, y: i32) {
         if let Some(last) = self.queue.back_mut() {
             if let InputPacket::AbsPos { .. } = last.packet {
-                if last.sched_time >= now {
+                if last.sched_time > now {
                     last.packet = InputPacket::AbsPos { x, y };
                     return;
                 }
             }
         }
-        let sched_time = now.max(self.prev_release_time);
-        self.queue.push_back(ScheduledPacket {
-            sched_time,
-            packet: InputPacket::AbsPos { x, y },
-            sink: Sink::Pointer,
-        });
-        self.prev_release_time = sched_time;
+        self.enqueue(now, rng, InputPacket::AbsPos { x, y }, Sink::Pointer);
     }
 
     /// Pop every packet whose `sched_time <= now` from the front of the queue,
@@ -452,13 +445,49 @@ mod tests {
     }
 
     #[test]
-    fn abs_pos_does_not_coalesce() {
-        // Back-to-back enqueues must produce two packets — unlike motion,
-        // samples are distinct points along a path.
+    fn abs_pos_coalesces_while_tail_pending() {
+        // With jittered timing, consecutive AbsPos samples that arrive
+        // before the tail's scheduled emission are merged: the tail keeps
+        // its sched_time but adopts the latest (x, y). This keeps the
+        // cursor monotonic — it jumps straight to the newest position
+        // when the deadline hits, never stepping through stale samples.
         let mut s = Scheduler::new(100);
-        let mut rng = MaxRng;
+        let mut rng = MaxRng; // first sched = now + 100 = 100
         s.enqueue_abs_pos(0, &mut rng, 100, 100);
         s.enqueue_abs_pos(10, &mut rng, 200, 200);
-        assert_eq!(s.queue_len(), 2);
+        assert_eq!(s.queue_len(), 1, "second sample must coalesce into tail");
+        let pkts = s.peek_all();
+        assert_eq!(pkts[0].packet, InputPacket::AbsPos { x: 200, y: 200 });
+        assert_eq!(pkts[0].sched_time, 100, "tail sched_time is preserved");
+    }
+
+    #[test]
+    fn abs_pos_is_jittered_like_keystrokes() {
+        // Per-sample sched_time must lie within [now, now + max_delay],
+        // same contract as keystroke timing anonymization.
+        let mut s = Scheduler::new(100);
+        let mut rng = MaxRng;
+        s.enqueue_abs_pos(0, &mut rng, 50, 50);
+        let pkts = s.peek_all();
+        assert_eq!(pkts[0].sched_time, 100, "MaxRng -> now + max_delay");
+
+        let mut s2 = Scheduler::new(100);
+        let mut rng2 = MinRng;
+        s2.enqueue_abs_pos(0, &mut rng2, 50, 50);
+        let pkts2 = s2.peek_all();
+        assert_eq!(pkts2[0].sched_time, 0, "MinRng at fresh queue -> now");
+    }
+
+    #[test]
+    fn abs_pos_respects_prev_release_ratchet() {
+        // A keystroke enqueued before an AbsPos must push the AbsPos's
+        // lower bound forward, matching the global FIFO ratchet.
+        let mut s = Scheduler::new(100);
+        let mut rng = MaxRng;
+        s.enqueue_key(0, &mut rng, 30, true); // sched=100, prev=100
+        // now=10: lower = min(max(100-10,0), 100) = 90. MaxRng picks 100.
+        s.enqueue_abs_pos(10, &mut rng, 50, 50);
+        let pkts = s.peek_all();
+        assert_eq!(pkts[1].sched_time, 110);
     }
 }
