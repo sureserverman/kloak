@@ -1,7 +1,7 @@
 # Design: VM-pointer ABS passthrough (Approach A1)
 
 **Date:** 2026-04-18
-**Status:** Implemented (commits 5b11c4f..1ed918a, VM smoke test 2026-04-18)
+**Status:** **Superseded by `2026-04-18-kloak-vm-pointer-v2-plan.md`** (2026-04-19). Single-uinput passthrough caused libinput to mis-classify the hybrid REL+ABS device and drop ABS events at the compositor. v2 splits the uinput sink into `kloak-kbd` + `kloak-pointer` so libinput sees two clean devices. Original status: Implemented (commits 5b11c4f..1ed918a, VM smoke test 2026-04-18)
 **Scope:** Make kloak-ubuntu usable inside libvirt/VMM and UTM (macOS QEMU) guests, whose pointer device is an emulated absolute tablet that the current evdev filter rejects.
 
 ---

@@ -1,6 +1,12 @@
 # Project Plan: VM-pointer anonymization v2 (split virtual devices)
 
 Date: 2026-04-18
+Status: **IMPLEMENTED (2026-04-19)** — all four stages landed on master
+(commits `adb8cb9`, `7b40915`, `890134b`, plus `4949c59` extending the
+scheduler to jitter `AbsPos` timing so cursor motion is also anonymized).
+VM verification: keyboard delays uniform in `[0, max_delay]`, cursor
+tracks smoothly, clicks land on target, escape combo exits cleanly.
+Smoke script: `rust/tests/smoke/stage4_keystroke_delay_and_escape.py`.
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
