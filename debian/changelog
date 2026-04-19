@@ -1,3 +1,11 @@
+kloak (0:0.7.5-1+ubuntu2) noble; urgency=medium
+
+  * Split uinput into kloak-kbd + kloak-pointer for VM tablet support;
+    anonymize cursor-motion timing; fix partial-frame axis zero-
+    teleport.
+
+ -- Sure Serverman <holyfiremin@gmail.com>  Sun, 19 Apr 2026 09:36:55 +0100
+
 kloak (0:0.7.5-1+ubuntu1) noble; urgency=medium
 
   * Ubuntu build: add ronn to Build-Depends.

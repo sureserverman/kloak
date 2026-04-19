@@ -1,5 +1,5 @@
 Package: kloak
-Version: 0.7.5
+Version: 0.7.6
 Maintainer: Server Man
 Architecture: amd64
 Description: Keystroke and mouse timing anonymization (uinput-based)
