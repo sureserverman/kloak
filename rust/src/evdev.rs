@@ -16,6 +16,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
+use crate::event::Sink;
 use crate::translate::FrameAccum;
 
 // ---------------------------------------------------------------------------
@@ -55,15 +56,17 @@ fn classify(ev_bits: &[u8], abs_bits: &[u8]) -> DeviceClass {
     if !has_abs {
         return DeviceClass::KeyOrRel;
     }
-    // Any EV_ABS device — real touchpad (ABS_MT_SLOT) or VM-emulated tablet
-    // (QEMU USB Tablet, virtio-tablet, spice vdagent tablet) — is left to
-    // the compositor. Forwarding absolute coordinates through kloak's
-    // virtual device mixed poorly with libinput's classification of a
-    // combined EV_REL+EV_ABS device and produced an erratic cursor.
-    // Keyboards and relative mice are still grabbed; VM pointer timing
-    // is therefore not anonymized, but cursor motion is usable.
-    let _ = has_bit(abs_bits, ABS_MT_SLOT as usize);
-    DeviceClass::Skip
+    // EV_ABS present. Real laptop touchpads advertise ABS_MT_SLOT (Protocol B);
+    // leave those to the compositor — kloak can't faithfully mirror MT gestures
+    // through a non-MT uinput sink. VM-emulated tablets (QEMU USB Tablet,
+    // virtio-tablet, spice vdagent tablet) have no ABS_MT_SLOT and route to
+    // the dedicated `kloak-pointer` sink so their button timing is anonymized
+    // without ABS events fighting libinput's REL+ABS classification.
+    if has_bit(abs_bits, ABS_MT_SLOT as usize) {
+        DeviceClass::Skip
+    } else {
+        DeviceClass::VmTablet
+    }
 }
 
 /// `struct input_event` exactly as the kernel writes it. Layout is stable
@@ -276,11 +279,16 @@ impl EvdevDevice {
             return Err(err);
         }
 
+        let sink = match classify(&ev_bits, &abs_bits) {
+            DeviceClass::VmTablet => Sink::Pointer,
+            _ => Sink::Kbd,
+        };
         let frame = FrameAccum {
             has_hi_res_vwheel,
             has_hi_res_hwheel,
             abs_x_max,
             abs_y_max,
+            sink,
             ..FrameAccum::default()
         };
         Ok(Some(Self {
@@ -435,13 +443,14 @@ mod tests {
     }
 
     #[test]
-    fn classify_vm_tablet_is_skipped() {
-        // VM-emulated tablets (EV_ABS without ABS_MT_SLOT) are left to the
-        // compositor; forwarding their coords through kloak fought libinput's
-        // REL+ABS classification and produced an erratic cursor.
+    fn classify_vm_tablet_is_vm_tablet() {
+        // VM-emulated tablets (EV_ABS without ABS_MT_SLOT) route to the
+        // dedicated kloak-pointer sink. Libinput sees a pure absolute
+        // pointer (no EV_REL on that sink) so ABS events pass through
+        // cleanly.
         let ev_bits = make_ev_bits(&[EV_KEY, EV_ABS]);
         let abs_bits = make_abs_bits(&[ABS_X, ABS_Y]);
-        assert_eq!(classify(&ev_bits, &abs_bits), DeviceClass::Skip);
+        assert_eq!(classify(&ev_bits, &abs_bits), DeviceClass::VmTablet);
     }
 
     #[test]

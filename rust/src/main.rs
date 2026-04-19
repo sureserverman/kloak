@@ -17,6 +17,7 @@ fn main() {
 #[cfg(target_os = "linux")]
 fn main() {
     use kloak::config::{ParseOutcome, USAGE};
+    use kloak::event::Sink;
     use kloak::evdev::EvdevCtx;
     use kloak::hotplug::{HotplugKind, Watcher};
     use kloak::time_src::now_ms;
@@ -70,7 +71,7 @@ fn main() {
         );
         std::process::exit(1);
     });
-    let _uinput_pointer = UInput::open_pointer().unwrap_or_else(|e| {
+    let uinput_pointer = UInput::open_pointer().unwrap_or_else(|e| {
         eprintln!("FATAL ERROR: Could not open /dev/uinput (pointer sink): {e}");
         eprintln!(
             "Ensure the 'uinput' kernel module is loaded and this process has CAP_SYS_ADMIN."
@@ -115,7 +116,11 @@ fn main() {
         // 2. Emit packets whose scheduled time has passed.
         let now = now_ms();
         for sp in scheduler.pop_due(now) {
-            uinput_kbd.emit_packet(sp.packet).unwrap_or_else(|e| {
+            let sink = match sp.sink {
+                Sink::Kbd => &uinput_kbd,
+                Sink::Pointer => &uinput_pointer,
+            };
+            sink.emit_packet(sp.packet).unwrap_or_else(|e| {
                 eprintln!("FATAL ERROR: uinput emit failed: {e}");
                 std::process::exit(1);
             });
@@ -183,14 +188,17 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
-fn is_self_uinput(name: &str) -> bool {
+fn device_name(name: &str) -> Option<String> {
     let path = format!("/sys/class/input/{name}/device/name");
-    std::fs::read_to_string(path)
-        .map(|s| {
-            let n = s.trim();
-            n == "kloak" || n == "kloak-kbd" || n == "kloak-pointer"
-        })
-        .unwrap_or(false)
+    std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn is_self_uinput(name: &str) -> bool {
+    matches!(
+        device_name(name).as_deref(),
+        Some("kloak") | Some("kloak-kbd") | Some("kloak-pointer")
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -204,26 +212,41 @@ fn enumerate_input_devices(ctx: &mut kloak::evdev::EvdevCtx) {
             std::process::exit(1);
         }
     };
-    // Collect + sort by name so enumeration is deterministic. Matters when
-    // multiple VM tablets coexist (QEMU USB Tablet on event2 vs. spice
-    // vdagent tablet on event4): the dedup logic in EvdevCtx::attach picks
-    // the first-attached VM tablet as the ABS forwarder, so lower-numbered
-    // devices — which are the real emulated hardware — win over later
-    // userspace uinput helpers.
-    let mut names: Vec<String> = dir
+    // Collect + sort. `EvdevCtx::attach` treats the first-attached VM tablet
+    // as the ABS forwarder and suppresses duplicates, so enumeration order
+    // decides which tablet drives the cursor. In practice only one tablet
+    // is actively emitting in any given VM configuration, so we prefer the
+    // one most likely to be active:
+    //   1. spice vdagent tablet — the uinput sink vdagentd writes to when
+    //      the client runs with a spice agent (the modern Wayland + virt-
+    //      manager default). If vdagent is active, the QEMU USB Tablet is
+    //      silent; suppressing vdagent here would drop ALL position updates.
+    //   2. Everything else — numeric event-suffix order so the boot order
+    //      of real devices is deterministic.
+    let mut entries: Vec<(u32, String)> = dir
         .flatten()
         .filter(|e| {
             e.file_name().to_string_lossy().starts_with("event")
                 && e.file_type().map(|t| t.is_char_device()).unwrap_or(false)
         })
-        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let priority = if device_name(&name) == Some("spice vdagent tablet".into()) {
+                0
+            } else {
+                1
+            };
+            (priority, name)
+        })
         .collect();
-    // Numeric sort on the suffix after "event" so event2 < event10.
-    names.sort_by_key(|n| {
-        n.trim_start_matches("event")
-            .parse::<u32>()
-            .unwrap_or(u32::MAX)
+    entries.sort_by(|a, b| {
+        a.0.cmp(&b.0).then_with(|| {
+            let an = a.1.trim_start_matches("event").parse::<u32>().unwrap_or(u32::MAX);
+            let bn = b.1.trim_start_matches("event").parse::<u32>().unwrap_or(u32::MAX);
+            an.cmp(&bn)
+        })
     });
+    let names: Vec<String> = entries.into_iter().map(|(_, n)| n).collect();
     for name_str in names {
         if is_self_uinput(&name_str) {
             continue;

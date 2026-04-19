@@ -24,6 +24,7 @@
 //! - EV_MSC, EV_LED, EV_REP, … → dropped.
 
 use crate::escape::EscCombo;
+use crate::event::Sink;
 use crate::queue::{RandBetween, Scheduler};
 use crate::scroll::drain_ticks;
 
@@ -55,7 +56,7 @@ const BTN_MISC: u16 = 0x100;
 /// the device's hi-res wheel capabilities (constant for the lifetime of
 /// the device, but kept here to keep `handle_raw_event`'s signature
 /// compact and so translate.rs stays independent of the evdev module).
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct FrameAccum {
     pub dx: i32,
     pub dy: i32,
@@ -70,10 +71,52 @@ pub struct FrameAccum {
     /// SYN_REPORT. Remains `None` outside VM-tablet devices.
     pub pending_abs_x: Option<i32>,
     pub pending_abs_y: Option<i32>,
+    /// Last flushed raw ABS_X / ABS_Y for this device. The evdev protocol
+    /// only emits the axis that changed within a SYN frame — if the upstream
+    /// moves only Y, the frame contains no ABS_X. Retain the prior value
+    /// here so `flush_frame` can fill the missing axis instead of defaulting
+    /// to 0 (which teleports the cursor to the left/top edge).
+    pub last_abs_x: Option<i32>,
+    pub last_abs_y: Option<i32>,
     /// `Some(max)` when the device is a VM tablet; drives normalization of
     /// raw ABS_X/Y into the uinput sink's 0..=32767 output range.
     pub abs_x_max: Option<i32>,
     pub abs_y_max: Option<i32>,
+    /// Which uinput sink packets from this source device route to. Real
+    /// keyboards and relative mice → `Sink::Kbd`; VM tablets → `Sink::Pointer`.
+    /// Keyboard keys always go to `Sink::Kbd` regardless (handled inside the
+    /// scheduler); buttons and scroll follow this field.
+    pub sink: Sink,
+    /// Pointer-button events deferred until `SYN_REPORT` on `Sink::Pointer`
+    /// devices. A VM tablet emits `[ABS_X, ABS_Y, BTN_LEFT, SYN]` in one
+    /// frame — enqueuing the button before the position update would make
+    /// the compositor register the click at the stale cursor location and
+    /// only then update the cursor. Buffering buttons here and flushing
+    /// them after `AbsPos` in `flush_frame` guarantees the queue order
+    /// `[AbsPos, Button]`, so `kloak-pointer` emits the position first.
+    /// `(code, pressed)`.
+    pub pending_buttons: Vec<(u16, bool)>,
+}
+
+impl Default for FrameAccum {
+    fn default() -> Self {
+        Self {
+            dx: 0,
+            dy: 0,
+            vert_v120: 0.0,
+            horiz_v120: 0.0,
+            has_hi_res_vwheel: false,
+            has_hi_res_hwheel: false,
+            pending_abs_x: None,
+            pending_abs_y: None,
+            last_abs_x: None,
+            last_abs_y: None,
+            abs_x_max: None,
+            abs_y_max: None,
+            sink: Sink::Kbd,
+            pending_buttons: Vec::new(),
+        }
+    }
 }
 
 /// Per-call translation context — everything shared across every raw
@@ -126,9 +169,15 @@ pub fn handle_raw_event(
                 }
                 ctx.scheduler
                     .enqueue_key(now, ctx.rng, u32::from(code), pressed);
+            } else if accum.sink == Sink::Pointer {
+                // Defer pointer-sink buttons until SYN_REPORT so `AbsPos`
+                // (flushed first in `flush_frame`) precedes the button in
+                // the queue — otherwise the click lands at the stale
+                // cursor position.
+                accum.pending_buttons.push((code, pressed));
             } else {
                 ctx.scheduler
-                    .enqueue_button(now, ctx.rng, u32::from(code), pressed);
+                    .enqueue_button(now, ctx.rng, u32::from(code), pressed, accum.sink);
             }
         }
         EV_REL => match code {
@@ -189,18 +238,40 @@ fn flush_frame(accum: &mut FrameAccum, now: i64, ctx: &mut TranslateCtx<'_>) {
         } else {
             (vert, horiz)
         };
-        ctx.scheduler.enqueue_scroll(now, ctx.rng, vert, horiz);
+        ctx.scheduler
+            .enqueue_scroll(now, ctx.rng, vert, horiz, accum.sink);
     }
     if let (Some(x_max), Some(y_max)) = (accum.abs_x_max, accum.abs_y_max) {
         if accum.pending_abs_x.is_some() || accum.pending_abs_y.is_some() {
-            let raw_x = accum.pending_abs_x.unwrap_or(0).clamp(0, x_max);
-            let raw_y = accum.pending_abs_y.unwrap_or(0).clamp(0, y_max);
+            // Fall back to the last-seen value for the axis that didn't
+            // update this frame; only fall back to 0 on the very first frame
+            // when no prior value exists (matches the kernel's own absinfo
+            // initial state).
+            let raw_x = accum
+                .pending_abs_x
+                .or(accum.last_abs_x)
+                .unwrap_or(0)
+                .clamp(0, x_max);
+            let raw_y = accum
+                .pending_abs_y
+                .or(accum.last_abs_y)
+                .unwrap_or(0)
+                .clamp(0, y_max);
             let x = (i64::from(raw_x) * 32767 / i64::from(x_max)) as i32;
             let y = (i64::from(raw_y) * 32767 / i64::from(y_max)) as i32;
             ctx.scheduler.enqueue_abs_pos(now, ctx.rng, x, y);
+            accum.last_abs_x = Some(raw_x);
+            accum.last_abs_y = Some(raw_y);
             accum.pending_abs_x = None;
             accum.pending_abs_y = None;
         }
+    }
+    // Flush deferred pointer-sink buttons AFTER AbsPos so the queue order
+    // is [AbsPos, Button]: kloak-pointer emits the position update first
+    // and the compositor registers the click at the up-to-date location.
+    for (code, pressed) in accum.pending_buttons.drain(..) {
+        ctx.scheduler
+            .enqueue_button(now, ctx.rng, u32::from(code), pressed, accum.sink);
     }
 }
 
@@ -383,6 +454,81 @@ mod tests {
             crate::event::InputPacket::AbsPos { x, y } => {
                 assert_eq!(x, 32767);
                 assert_eq!(y, 0);
+            }
+            _ => panic!("expected AbsPos"),
+        }
+    }
+
+    #[test]
+    fn tablet_button_emits_after_abs_pos_in_same_frame() {
+        // Regression: when a VM tablet emits [ABS_X, ABS_Y, BTN_LEFT, SYN]
+        // the queue must be [AbsPos, Button] so kloak-pointer updates the
+        // cursor position before the compositor sees the click.
+        let mut h = Harness::new();
+        h.accum.abs_x_max = Some(1000);
+        h.accum.abs_y_max = Some(1000);
+        h.accum.sink = Sink::Pointer;
+
+        h.feed(EV_ABS, ABS_X, 500, false, false);
+        h.feed(EV_ABS, ABS_Y, 500, false, false);
+        h.feed(EV_KEY, 0x110, 1, false, false); // BTN_LEFT press
+        h.feed(EV_SYN, SYN_REPORT, 0, false, false);
+
+        let pkts = h.scheduler.pop_due(1_000_000);
+        assert_eq!(pkts.len(), 2, "one AbsPos + one Button");
+        assert!(
+            matches!(pkts[0].packet, crate::event::InputPacket::AbsPos { .. }),
+            "AbsPos must precede Button, got {:?}",
+            pkts[0].packet
+        );
+        assert!(
+            matches!(pkts[1].packet, crate::event::InputPacket::Button { .. }),
+            "Button must follow AbsPos, got {:?}",
+            pkts[1].packet
+        );
+        assert_eq!(pkts[1].sink, Sink::Pointer);
+    }
+
+    #[test]
+    fn kbd_sink_button_still_enqueues_immediately() {
+        // Buttons on the keyboard sink (real mice) are not deferred: they
+        // don't share a SYN frame with AbsPos, so no ordering surgery
+        // needed, and deferring would delay them by one poll iteration.
+        let mut h = Harness::new();
+        h.accum.sink = Sink::Kbd;
+        h.feed(EV_KEY, 0x110, 1, false, false);
+        // Enqueued before SYN — no buffering on Kbd sink.
+        assert_eq!(h.scheduler.queue_len(), 1);
+    }
+
+    #[test]
+    fn partial_abs_frame_retains_prior_axis_value() {
+        // Regression: evdev only emits axes that changed within a SYN frame.
+        // A frame carrying only ABS_Y must not teleport X to 0 — it must
+        // reuse the last-seen X value.
+        let mut h = Harness::new();
+        h.accum.abs_x_max = Some(1000);
+        h.accum.abs_y_max = Some(1000);
+
+        // First frame: full [ABS_X, ABS_Y, SYN].
+        h.feed(EV_ABS, ABS_X, 500, false, false);
+        h.feed(EV_ABS, ABS_Y, 500, false, false);
+        h.feed(EV_SYN, SYN_REPORT, 0, false, false);
+
+        // Second frame: only ABS_Y changes. X should stay at 500, NOT 0.
+        h.feed(EV_ABS, ABS_Y, 600, false, false);
+        h.feed(EV_SYN, SYN_REPORT, 0, false, false);
+
+        // Scheduler coalesces consecutive AbsPos packets — the final value
+        // is what matters for the regression check.
+        let pkts = h.scheduler.pop_due(1_000_000);
+        assert!(!pkts.is_empty());
+        let last = pkts.last().unwrap();
+        match last.packet {
+            crate::event::InputPacket::AbsPos { x, y } => {
+                // 500/1000 * 32767 = 16383; 600/1000 * 32767 = 19660.
+                assert_eq!(x, 16383, "X must retain prior value, not reset to 0");
+                assert_eq!(y, 19660);
             }
             _ => panic!("expected AbsPos"),
         }

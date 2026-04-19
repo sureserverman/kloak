@@ -10,6 +10,18 @@
 
 use std::fmt;
 
+/// Which uinput sink a scheduled packet should be emitted on. Relative-motion
+/// and keyboard packets go to `Kbd`; absolute-position packets (and the
+/// pointer buttons that share the VM-tablet source device) go to `Pointer`.
+/// Kept separate from `InputPacket` because one payload shape (e.g. a
+/// `Button`) can legitimately come from either a real mouse or a VM tablet
+/// and must route differently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sink {
+    Kbd,
+    Pointer,
+}
+
 /// Raw input payload produced by libinput translation and consumed by the
 /// uinput emitter. See §4, §5, §8 of the behavior matrix for semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

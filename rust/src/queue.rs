@@ -16,7 +16,7 @@
 //! `Scheduler::{enqueue_key, enqueue_button, enqueue_motion, enqueue_scroll,
 //! enqueue_abs_pos, pop_due, next_deadline}`.
 
-use crate::event::InputPacket;
+use crate::event::{InputPacket, Sink};
 use std::collections::VecDeque;
 
 /// Randomness source for the jitter scheduler.
@@ -53,6 +53,7 @@ pub fn coalesce_motion(last_dx: i32, last_dy: i32, new_dx: i32, new_dy: i32) -> 
 pub struct ScheduledPacket {
     pub sched_time: i64,
     pub packet: InputPacket,
+    pub sink: Sink,
 }
 
 #[derive(Debug)]
@@ -90,16 +91,21 @@ impl Scheduler {
         self.queue.iter().copied().collect()
     }
 
-    fn enqueue(&mut self, now: i64, rng: &mut dyn RandBetween, packet: InputPacket) {
+    fn enqueue(&mut self, now: i64, rng: &mut dyn RandBetween, packet: InputPacket, sink: Sink) {
         let lower = lower_bound(now, self.prev_release_time, self.max_delay);
         let delay = rng.between(lower, i64::from(self.max_delay));
         let sched_time = now.saturating_add(delay);
-        self.queue.push_back(ScheduledPacket { sched_time, packet });
+        self.queue.push_back(ScheduledPacket {
+            sched_time,
+            packet,
+            sink,
+        });
         self.prev_release_time = sched_time;
     }
 
     pub fn enqueue_key(&mut self, now: i64, rng: &mut dyn RandBetween, code: u32, pressed: bool) {
-        self.enqueue(now, rng, InputPacket::Key { code, pressed });
+        // Keyboard keys are only meaningful on the keyboard sink.
+        self.enqueue(now, rng, InputPacket::Key { code, pressed }, Sink::Kbd);
     }
 
     pub fn enqueue_button(
@@ -108,8 +114,9 @@ impl Scheduler {
         rng: &mut dyn RandBetween,
         code: u32,
         pressed: bool,
+        sink: Sink,
     ) {
-        self.enqueue(now, rng, InputPacket::Button { code, pressed });
+        self.enqueue(now, rng, InputPacket::Button { code, pressed }, sink);
     }
 
     /// Enqueue a motion packet, coalescing into the last packet when possible.
@@ -128,15 +135,24 @@ impl Scheduler {
                 }
             }
         }
-        self.enqueue(now, rng, InputPacket::Motion { dx, dy });
+        // Relative motion only comes from KeyOrRel-class devices (real mice);
+        // VM tablets emit AbsPos instead.
+        self.enqueue(now, rng, InputPacket::Motion { dx, dy }, Sink::Kbd);
     }
 
     /// Enqueue a scroll packet; drops a no-op (both ticks zero).
-    pub fn enqueue_scroll(&mut self, now: i64, rng: &mut dyn RandBetween, vert: i32, horiz: i32) {
+    pub fn enqueue_scroll(
+        &mut self,
+        now: i64,
+        rng: &mut dyn RandBetween,
+        vert: i32,
+        horiz: i32,
+        sink: Sink,
+    ) {
         if vert == 0 && horiz == 0 {
             return;
         }
-        self.enqueue(now, rng, InputPacket::Scroll { vert, horiz });
+        self.enqueue(now, rng, InputPacket::Scroll { vert, horiz }, sink);
     }
 
     /// Enqueue an absolute-position packet (VM-tablet passthrough).
@@ -168,6 +184,7 @@ impl Scheduler {
         self.queue.push_back(ScheduledPacket {
             sched_time,
             packet: InputPacket::AbsPos { x, y },
+            sink: Sink::Pointer,
         });
         self.prev_release_time = sched_time;
     }
@@ -364,7 +381,7 @@ mod tests {
     fn scroll_zero_is_dropped() {
         let mut s = Scheduler::new(100);
         let mut rng = MaxRng;
-        s.enqueue_scroll(0, &mut rng, 0, 0);
+        s.enqueue_scroll(0, &mut rng, 0, 0, Sink::Kbd);
         assert!(s.is_empty());
     }
 
@@ -372,8 +389,43 @@ mod tests {
     fn scroll_nonzero_enqueues() {
         let mut s = Scheduler::new(100);
         let mut rng = MaxRng;
-        s.enqueue_scroll(0, &mut rng, 1, 0);
+        s.enqueue_scroll(0, &mut rng, 1, 0, Sink::Kbd);
         assert_eq!(s.queue_len(), 1);
+    }
+
+    #[test]
+    fn enqueue_key_uses_kbd_sink() {
+        let mut s = Scheduler::new(100);
+        let mut rng = MinRng;
+        s.enqueue_key(0, &mut rng, 30, true);
+        assert_eq!(s.peek_all()[0].sink, Sink::Kbd);
+    }
+
+    #[test]
+    fn enqueue_motion_uses_kbd_sink() {
+        let mut s = Scheduler::new(100);
+        let mut rng = MinRng;
+        s.enqueue_motion(0, &mut rng, 1, 1);
+        assert_eq!(s.peek_all()[0].sink, Sink::Kbd);
+    }
+
+    #[test]
+    fn enqueue_abs_pos_uses_pointer_sink() {
+        let mut s = Scheduler::new(100);
+        let mut rng = MinRng;
+        s.enqueue_abs_pos(0, &mut rng, 100, 200);
+        assert_eq!(s.peek_all()[0].sink, Sink::Pointer);
+    }
+
+    #[test]
+    fn enqueue_button_respects_given_sink() {
+        let mut s = Scheduler::new(100);
+        let mut rng = MinRng;
+        s.enqueue_button(0, &mut rng, 0x110, true, Sink::Pointer);
+        s.enqueue_button(0, &mut rng, 0x110, true, Sink::Kbd);
+        let pkts = s.peek_all();
+        assert_eq!(pkts[0].sink, Sink::Pointer);
+        assert_eq!(pkts[1].sink, Sink::Kbd);
     }
 
     #[test]
