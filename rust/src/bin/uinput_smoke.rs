@@ -37,7 +37,7 @@ fn press(ui: &UInput, code: u32) -> io::Result<()> {
 }
 
 fn main() -> ExitCode {
-    let ui = match UInput::open() {
+    let ui = match UInput::open_kbd() {
         Ok(ui) => ui,
         Err(e) => {
             eprintln!("uinput open: {e}");

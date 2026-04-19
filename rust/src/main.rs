@@ -63,8 +63,15 @@ fn main() {
         std::process::exit(1);
     });
 
-    let uinput = UInput::open().unwrap_or_else(|e| {
-        eprintln!("FATAL ERROR: Could not open /dev/uinput: {e}");
+    let uinput_kbd = UInput::open_kbd().unwrap_or_else(|e| {
+        eprintln!("FATAL ERROR: Could not open /dev/uinput (kbd sink): {e}");
+        eprintln!(
+            "Ensure the 'uinput' kernel module is loaded and this process has CAP_SYS_ADMIN."
+        );
+        std::process::exit(1);
+    });
+    let _uinput_pointer = UInput::open_pointer().unwrap_or_else(|e| {
+        eprintln!("FATAL ERROR: Could not open /dev/uinput (pointer sink): {e}");
         eprintln!(
             "Ensure the 'uinput' kernel module is loaded and this process has CAP_SYS_ADMIN."
         );
@@ -108,7 +115,7 @@ fn main() {
         // 2. Emit packets whose scheduled time has passed.
         let now = now_ms();
         for sp in scheduler.pop_due(now) {
-            uinput.emit_packet(sp.packet).unwrap_or_else(|e| {
+            uinput_kbd.emit_packet(sp.packet).unwrap_or_else(|e| {
                 eprintln!("FATAL ERROR: uinput emit failed: {e}");
                 std::process::exit(1);
             });
@@ -179,7 +186,10 @@ fn main() {
 fn is_self_uinput(name: &str) -> bool {
     let path = format!("/sys/class/input/{name}/device/name");
     std::fs::read_to_string(path)
-        .map(|s| s.trim() == "kloak")
+        .map(|s| {
+            let n = s.trim();
+            n == "kloak" || n == "kloak-kbd" || n == "kloak-pointer"
+        })
         .unwrap_or(false)
 }
 

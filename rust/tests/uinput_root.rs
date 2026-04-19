@@ -24,7 +24,7 @@ const SETTLE: Duration = Duration::from_secs(2);
 #[test]
 #[ignore = "requires root and /dev/uinput"]
 fn root_uinput_open_and_drop() {
-    let ui = UInput::open().expect("UInput::open failed; run as root");
+    let ui = UInput::open_kbd().expect("UInput::open_kbd failed; run as root");
     sleep(SETTLE);
     drop(ui);
     // The device path is gone after Drop — no stale /sys entry pointing at
@@ -34,7 +34,7 @@ fn root_uinput_open_and_drop() {
 #[test]
 #[ignore = "requires root and /dev/uinput"]
 fn root_uinput_appears_in_sysfs() {
-    let ui = UInput::open().expect("UInput::open failed; run as root");
+    let ui = UInput::open_kbd().expect("UInput::open_kbd failed; run as root");
     sleep(SETTLE);
     // Under /sys/class/input there will be one input entry whose `name`
     // attribute matches "kloak". We scan rather than pin a number because
@@ -44,20 +44,23 @@ fn root_uinput_appears_in_sysfs() {
         let entry = entry.expect("entry");
         let name_path = entry.path().join("name");
         if let Ok(name) = fs::read_to_string(&name_path) {
-            if name.trim() == "kloak" {
+            if name.trim() == "kloak-kbd" {
                 found = true;
                 break;
             }
         }
     }
-    assert!(found, "no /sys/class/input/*/name == 'kloak' after open");
+    assert!(
+        found,
+        "no /sys/class/input/*/name == 'kloak-kbd' after open"
+    );
     drop(ui);
 }
 
 #[test]
 #[ignore = "requires root and /dev/uinput"]
 fn root_uinput_emit_packets() {
-    let ui = UInput::open().expect("UInput::open failed; run as root");
+    let ui = UInput::open_kbd().expect("UInput::open_kbd failed; run as root");
     sleep(SETTLE);
 
     // Key press+release, motion, scroll, button. Each call is a fully

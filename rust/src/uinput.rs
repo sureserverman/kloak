@@ -70,6 +70,102 @@ const UINPUT_MAX_NAME_SIZE: usize = 80;
 /// and virtio-tablet need.
 const INPUT_PROP_POINTER: u16 = 0x00;
 
+/// Pointer-button codes we advertise on the absolute-pointer sink. Anything
+/// outside this list — keyboard keys, tablet-tool buttons (`BTN_TOOL_*`),
+/// joystick buttons — is intentionally omitted so libinput classifies the
+/// device as a plain absolute mouse, not a keyboard or drawing tablet.
+const POINTER_BUTTONS: &[u16] = &[
+    0x110, // BTN_LEFT
+    0x111, // BTN_RIGHT
+    0x112, // BTN_MIDDLE
+    0x113, // BTN_SIDE
+    0x114, // BTN_EXTRA
+    0x115, // BTN_FORWARD
+    0x116, // BTN_BACK
+    0x117, // BTN_TASK
+];
+
+/// Which kind of virtual device to open. Each kind produces a disjoint
+/// capability set so libinput classifies them unambiguously:
+/// - `Kbd` carries `EV_KEY` + `EV_REL` + `EV_MSC` — keyboard + relative mouse.
+/// - `Pointer` carries `EV_KEY` (pointer buttons only) + `EV_ABS` with
+///   `INPUT_PROP_POINTER` — absolute mouse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinkKind {
+    Kbd,
+    Pointer,
+}
+
+/// One step in the uinput capability-setup sequence. A pure description so
+/// `capability_plan` is testable without touching `/dev/uinput`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapCall {
+    SetEvBit(u16),
+    SetKeyBit(u16),
+    SetRelBit(u16),
+    SetAbsBit(u16),
+    SetMscBit(u16),
+    SetPropBit(u16),
+    AbsSetup { code: u16, min: i32, max: i32 },
+}
+
+/// Compute the ordered ioctl sequence for `kind`. Pure — returns the plan,
+/// does not touch `/dev/uinput`. Kept separate so the capability set can be
+/// asserted in unit tests.
+fn capability_plan(kind: SinkKind) -> Vec<CapCall> {
+    let mut plan = Vec::new();
+    match kind {
+        SinkKind::Kbd => {
+            plan.push(CapCall::SetEvBit(EV_SYN));
+            plan.push(CapCall::SetEvBit(EV_KEY));
+            plan.push(CapCall::SetEvBit(EV_REL));
+            plan.push(CapCall::SetEvBit(EV_MSC));
+            for code in 1..=KEY_MAX {
+                if (BTN_TOOL_FIRST..=BTN_TOOL_LAST).contains(&code) {
+                    continue;
+                }
+                plan.push(CapCall::SetKeyBit(code));
+            }
+            plan.push(CapCall::SetRelBit(REL_X));
+            plan.push(CapCall::SetRelBit(REL_Y));
+            plan.push(CapCall::SetRelBit(REL_WHEEL));
+            plan.push(CapCall::SetRelBit(REL_HWHEEL));
+            plan.push(CapCall::SetRelBit(REL_WHEEL_HI_RES));
+            plan.push(CapCall::SetRelBit(REL_HWHEEL_HI_RES));
+            plan.push(CapCall::SetMscBit(MSC_SCAN));
+        }
+        SinkKind::Pointer => {
+            plan.push(CapCall::SetEvBit(EV_SYN));
+            plan.push(CapCall::SetEvBit(EV_KEY));
+            plan.push(CapCall::SetEvBit(EV_ABS));
+            plan.push(CapCall::SetPropBit(INPUT_PROP_POINTER));
+            for &btn in POINTER_BUTTONS {
+                plan.push(CapCall::SetKeyBit(btn));
+            }
+            plan.push(CapCall::SetAbsBit(ABS_X));
+            plan.push(CapCall::SetAbsBit(ABS_Y));
+            plan.push(CapCall::AbsSetup {
+                code: ABS_X,
+                min: 0,
+                max: 32767,
+            });
+            plan.push(CapCall::AbsSetup {
+                code: ABS_Y,
+                min: 0,
+                max: 32767,
+            });
+        }
+    }
+    plan
+}
+
+fn device_name(kind: SinkKind) -> &'static [u8] {
+    match kind {
+        SinkKind::Kbd => b"kloak-kbd",
+        SinkKind::Pointer => b"kloak-pointer",
+    }
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Default)]
 struct InputAbsinfo {
@@ -156,66 +252,47 @@ pub struct UInput {
 }
 
 impl UInput {
-    /// Open `/dev/uinput`, declare every event code kloak may emit, and
-    /// create the virtual device. Returns a ready-to-use handle on success.
+    /// Open `/dev/uinput` and create a virtual device of the given kind.
+    /// Capability set is computed by [`capability_plan`] — kept separate so
+    /// it is testable without touching the kernel.
     ///
     /// Fails with `io::Error` (errno-backed) if any step fails; partial
     /// state is cleaned up by `File`'s Drop via the `?` early-return.
-    pub fn open() -> io::Result<Self> {
+    pub fn open_with(kind: SinkKind) -> io::Result<Self> {
         let file = OpenOptions::new()
             .write(true)
             .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(UINPUT_DEV_PATH)?;
         let fd = file.as_raw_fd();
 
-        set_evbit(fd, EV_SYN)?;
-        set_evbit(fd, EV_KEY)?;
-        set_evbit(fd, EV_REL)?;
-        set_evbit(fd, EV_ABS)?;
-        set_evbit(fd, EV_MSC)?;
-
-        // INPUT_PROP_POINTER must be set BEFORE UI_DEV_CREATE. Without it,
-        // advertising EV_ABS + ABS_X/Y causes udev to tag the virtual device
-        // `ID_INPUT_TABLET` and GNOME Shell treats it as a drawing tablet —
-        // the exact bug the old C daemon hit. With the flag, udev tags it
-        // `ID_INPUT_MOUSE` and compositors map it to a pointer.
-        ioctl_int(fd, UI_SET_PROPBIT, c_int::from(INPUT_PROP_POINTER))?;
-
-        // Advertise every KEY_ / BTN_ code EXCEPT the digitizer/tablet-tool
-        // range 0x140..=0x14f (BTN_TOOL_PEN, BTN_TOUCH, BTN_STYLUS, etc.).
-        // Advertising those in combination with EV_ABS makes libinput
-        // classify the device as a drawing tablet and reject it for
-        // missing tablet resolution. Skipping the range keeps us a plain
-        // pointer+keyboard, which is what compositors dispatch pointer
-        // events to.
-        for code in 1..=KEY_MAX {
-            if (BTN_TOOL_FIRST..=BTN_TOOL_LAST).contains(&code) {
-                continue;
+        for call in capability_plan(kind) {
+            match call {
+                CapCall::SetEvBit(code) => set_evbit(fd, code)?,
+                CapCall::SetKeyBit(code) => set_keybit(fd, code)?,
+                CapCall::SetRelBit(code) => set_relbit(fd, code)?,
+                CapCall::SetAbsBit(code) => set_absbit(fd, code)?,
+                CapCall::SetMscBit(code) => set_mscbit(fd, code)?,
+                CapCall::SetPropBit(code) => {
+                    ioctl_int(fd, UI_SET_PROPBIT, c_int::from(code))?
+                }
+                CapCall::AbsSetup { code, min, max } => abs_setup(fd, code, min, max)?,
             }
-            set_keybit(fd, code)?;
         }
 
-        set_relbit(fd, REL_X)?;
-        set_relbit(fd, REL_Y)?;
-        set_relbit(fd, REL_WHEEL)?;
-        set_relbit(fd, REL_HWHEEL)?;
-        set_relbit(fd, REL_WHEEL_HI_RES)?;
-        set_relbit(fd, REL_HWHEEL_HI_RES)?;
-
-        // Absolute axes for the VM-tablet passthrough path. Range 0..32767
-        // matches what translate.rs normalizes raw per-device values into,
-        // independent of each source device's own max.
-        set_absbit(fd, ABS_X)?;
-        set_absbit(fd, ABS_Y)?;
-        abs_setup(fd, ABS_X, 0, 32767)?;
-        abs_setup(fd, ABS_Y, 0, 32767)?;
-
-        set_mscbit(fd, MSC_SCAN)?;
-
-        dev_setup(fd)?;
+        dev_setup(fd, device_name(kind))?;
         dev_create(fd)?;
 
         Ok(Self { file })
+    }
+
+    /// Open the keyboard / relative-mouse sink (`kloak-kbd`).
+    pub fn open_kbd() -> io::Result<Self> {
+        Self::open_with(SinkKind::Kbd)
+    }
+
+    /// Open the absolute-pointer sink (`kloak-pointer`).
+    pub fn open_pointer() -> io::Result<Self> {
+        Self::open_with(SinkKind::Pointer)
     }
 
     /// Raw evdev record emitter. Thin wrapper around `write(2)`.
@@ -353,10 +430,10 @@ fn abs_setup(fd: RawFd, code: u16, min: i32, max: i32) -> io::Result<()> {
     }
 }
 
-fn dev_setup(fd: RawFd) -> io::Result<()> {
+fn dev_setup(fd: RawFd, label: &[u8]) -> io::Result<()> {
     let mut name = [0u8; UINPUT_MAX_NAME_SIZE];
-    let label = b"kloak";
-    name[..label.len()].copy_from_slice(label);
+    let len = label.len().min(UINPUT_MAX_NAME_SIZE - 1);
+    name[..len].copy_from_slice(&label[..len]);
     let setup = UinputSetup {
         id: InputId {
             bustype: BUS_VIRTUAL,
@@ -391,6 +468,71 @@ fn dev_create(fd: RawFd) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sink_kind_kbd_advertises_rel_not_abs() {
+        let plan = capability_plan(SinkKind::Kbd);
+        assert!(plan.contains(&CapCall::SetEvBit(EV_REL)));
+        assert!(!plan.contains(&CapCall::SetEvBit(EV_ABS)));
+        assert!(plan.iter().any(|c| matches!(c, CapCall::SetRelBit(_))));
+        assert!(!plan.iter().any(|c| matches!(c, CapCall::SetAbsBit(_))));
+        // No INPUT_PROP_POINTER on the kbd sink — it's a keyboard + relmouse.
+        assert!(!plan.iter().any(|c| matches!(c, CapCall::SetPropBit(_))));
+    }
+
+    #[test]
+    fn sink_kind_pointer_advertises_abs_not_rel() {
+        let plan = capability_plan(SinkKind::Pointer);
+        assert!(plan.contains(&CapCall::SetEvBit(EV_ABS)));
+        assert!(!plan.contains(&CapCall::SetEvBit(EV_REL)));
+        assert!(plan.contains(&CapCall::SetAbsBit(ABS_X)));
+        assert!(plan.contains(&CapCall::SetAbsBit(ABS_Y)));
+        assert!(!plan.iter().any(|c| matches!(c, CapCall::SetRelBit(_))));
+        assert!(plan.contains(&CapCall::SetPropBit(INPUT_PROP_POINTER)));
+        assert!(plan.contains(&CapCall::AbsSetup {
+            code: ABS_X,
+            min: 0,
+            max: 32767,
+        }));
+    }
+
+    #[test]
+    fn sink_kind_pointer_advertises_only_mouse_buttons() {
+        let plan = capability_plan(SinkKind::Pointer);
+        // BTN_LEFT present.
+        assert!(plan.contains(&CapCall::SetKeyBit(0x110)));
+        // A keyboard key (KEY_A = 0x1e) must NOT be present on the pointer.
+        assert!(!plan.contains(&CapCall::SetKeyBit(0x1e)));
+        // BTN_TOOL_PEN (0x140) must NOT be present — would trigger libinput
+        // tablet classification and the "missing tablet resolution" reject.
+        assert!(!plan.contains(&CapCall::SetKeyBit(0x140)));
+        assert!(!plan.contains(&CapCall::SetKeyBit(0x14b))); // BTN_STYLUS
+    }
+
+    #[test]
+    fn sink_kind_kbd_advertises_keyboard_and_mouse_buttons() {
+        let plan = capability_plan(SinkKind::Kbd);
+        assert!(plan.contains(&CapCall::SetKeyBit(0x1e))); // KEY_A
+        assert!(plan.contains(&CapCall::SetKeyBit(0x110))); // BTN_LEFT
+    }
+
+    #[test]
+    fn sink_kind_kbd_skips_tablet_tool_range() {
+        let plan = capability_plan(SinkKind::Kbd);
+        for code in BTN_TOOL_FIRST..=BTN_TOOL_LAST {
+            assert!(
+                !plan.contains(&CapCall::SetKeyBit(code)),
+                "BTN_TOOL_* code 0x{:x} leaked into kbd plan",
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn sink_kind_names_are_distinct() {
+        assert_eq!(device_name(SinkKind::Kbd), b"kloak-kbd");
+        assert_eq!(device_name(SinkKind::Pointer), b"kloak-pointer");
+    }
 
     #[test]
     fn ioctl_numbers_match_kernel_abi() {
