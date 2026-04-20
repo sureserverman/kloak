@@ -272,9 +272,7 @@ impl UInput {
                 CapCall::SetRelBit(code) => set_relbit(fd, code)?,
                 CapCall::SetAbsBit(code) => set_absbit(fd, code)?,
                 CapCall::SetMscBit(code) => set_mscbit(fd, code)?,
-                CapCall::SetPropBit(code) => {
-                    ioctl_int(fd, UI_SET_PROPBIT, c_int::from(code))?
-                }
+                CapCall::SetPropBit(code) => ioctl_int(fd, UI_SET_PROPBIT, c_int::from(code))?,
                 CapCall::AbsSetup { code, min, max } => abs_setup(fd, code, min, max)?,
             }
         }

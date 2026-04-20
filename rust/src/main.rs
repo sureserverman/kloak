@@ -17,8 +17,8 @@ fn main() {
 #[cfg(target_os = "linux")]
 fn main() {
     use kloak::config::{ParseOutcome, USAGE};
-    use kloak::event::Sink;
     use kloak::evdev::EvdevCtx;
+    use kloak::event::Sink;
     use kloak::hotplug::{HotplugKind, Watcher};
     use kloak::time_src::now_ms;
     use kloak::translate::{handle_raw_event, TranslateCtx};
@@ -91,6 +91,16 @@ fn main() {
     let mut event_buf: Vec<(u16, u16, i32)> = Vec::with_capacity(64);
 
     loop {
+        // First-emitter-wins latch, derived fresh from current device state.
+        // `true` iff some attached VM tablet already won the race (its
+        // `FrameAccum::is_primary_tablet` is set). Deriving rather than
+        // persisting means the latch auto-resets when the primary tablet
+        // detaches — otherwise a dead winner (e.g. spice vdagent tablet torn
+        // down mid-session) would permanently mute every surviving tablet.
+        let mut primary_tablet_chosen = ctx
+            .devices_mut()
+            .any(|d| d.frame.is_primary_tablet);
+
         // 1. Drain every device's pending events, feed translate.
         let names = ctx.names();
         for name in &names {
@@ -106,6 +116,7 @@ fn main() {
                     rng: &mut rng,
                     esc_combo: &mut esc_combo,
                     natural_scrolling: cfg.natural_scrolling,
+                    primary_tablet_chosen: &mut primary_tablet_chosen,
                 };
                 if handle_raw_event(type_, code, value, &mut dev.frame, now, &mut tctx) {
                     std::process::exit(0);
@@ -190,7 +201,9 @@ fn main() {
 #[cfg(target_os = "linux")]
 fn device_name(name: &str) -> Option<String> {
     let path = format!("/sys/class/input/{name}/device/name");
-    std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -212,41 +225,24 @@ fn enumerate_input_devices(ctx: &mut kloak::evdev::EvdevCtx) {
             std::process::exit(1);
         }
     };
-    // Collect + sort. `EvdevCtx::attach` treats the first-attached VM tablet
-    // as the ABS forwarder and suppresses duplicates, so enumeration order
-    // decides which tablet drives the cursor. In practice only one tablet
-    // is actively emitting in any given VM configuration, so we prefer the
-    // one most likely to be active:
-    //   1. spice vdagent tablet — the uinput sink vdagentd writes to when
-    //      the client runs with a spice agent (the modern Wayland + virt-
-    //      manager default). If vdagent is active, the QEMU USB Tablet is
-    //      silent; suppressing vdagent here would drop ALL position updates.
-    //   2. Everything else — numeric event-suffix order so the boot order
-    //      of real devices is deterministic.
-    let mut entries: Vec<(u32, String)> = dir
+    // First-emitter-wins replaces the old "prefer spice vdagent tablet"
+    // priority rule — every VM tablet is grabbed but only the one that
+    // actually emits ABS first drives the cursor, so enumeration order
+    // no longer decides correctness. Sort numerically by event suffix so
+    // device-attachment order stays deterministic for logging/debugging.
+    let mut names: Vec<String> = dir
         .flatten()
         .filter(|e| {
             e.file_name().to_string_lossy().starts_with("event")
                 && e.file_type().map(|t| t.is_char_device()).unwrap_or(false)
         })
-        .map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let priority = if device_name(&name) == Some("spice vdagent tablet".into()) {
-                0
-            } else {
-                1
-            };
-            (priority, name)
-        })
+        .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
-    entries.sort_by(|a, b| {
-        a.0.cmp(&b.0).then_with(|| {
-            let an = a.1.trim_start_matches("event").parse::<u32>().unwrap_or(u32::MAX);
-            let bn = b.1.trim_start_matches("event").parse::<u32>().unwrap_or(u32::MAX);
-            an.cmp(&bn)
-        })
+    names.sort_by_key(|n| {
+        n.trim_start_matches("event")
+            .parse::<u32>()
+            .unwrap_or(u32::MAX)
     });
-    let names: Vec<String> = entries.into_iter().map(|(_, n)| n).collect();
     for name_str in names {
         if is_self_uinput(&name_str) {
             continue;

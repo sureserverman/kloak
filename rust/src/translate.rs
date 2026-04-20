@@ -87,6 +87,13 @@ pub struct FrameAccum {
     /// Keyboard keys always go to `Sink::Kbd` regardless (handled inside the
     /// scheduler); buttons and scroll follow this field.
     pub sink: Sink,
+    /// First-emitter-wins flag for VM tablets. Initially `false` on every
+    /// attached VM tablet; set to `true` the first time this device emits
+    /// an `EV_ABS` in a SYN frame IF no other VM tablet has already been
+    /// promoted. Non-primary VM tablets have all their pointer output
+    /// (ABS + buttons) dropped, so a silent decoy tablet can't steal the
+    /// click stream from the one the SPICE client is actually using.
+    pub is_primary_tablet: bool,
     /// Pointer-button events deferred until `SYN_REPORT` on `Sink::Pointer`
     /// devices. A VM tablet emits `[ABS_X, ABS_Y, BTN_LEFT, SYN]` in one
     /// frame — enqueuing the button before the position update would make
@@ -115,6 +122,7 @@ impl Default for FrameAccum {
             abs_y_max: None,
             sink: Sink::Kbd,
             pending_buttons: Vec::new(),
+            is_primary_tablet: false,
         }
     }
 }
@@ -128,6 +136,10 @@ pub struct TranslateCtx<'a> {
     pub rng: &'a mut dyn RandBetween,
     pub esc_combo: &'a mut EscCombo,
     pub natural_scrolling: bool,
+    /// Shared first-emitter-wins latch. Flipped to `true` by `flush_frame` the
+    /// first time any VM tablet emits an `EV_ABS`. Once set, no further tablet
+    /// can become primary for the lifetime of the daemon.
+    pub primary_tablet_chosen: &'a mut bool,
 }
 
 impl std::fmt::Debug for TranslateCtx<'_> {
@@ -243,25 +255,36 @@ fn flush_frame(accum: &mut FrameAccum, now: i64, ctx: &mut TranslateCtx<'_>) {
     }
     if let (Some(x_max), Some(y_max)) = (accum.abs_x_max, accum.abs_y_max) {
         if accum.pending_abs_x.is_some() || accum.pending_abs_y.is_some() {
-            // Fall back to the last-seen value for the axis that didn't
-            // update this frame; only fall back to 0 on the very first frame
-            // when no prior value exists (matches the kernel's own absinfo
-            // initial state).
-            let raw_x = accum
-                .pending_abs_x
-                .or(accum.last_abs_x)
-                .unwrap_or(0)
-                .clamp(0, x_max);
-            let raw_y = accum
-                .pending_abs_y
-                .or(accum.last_abs_y)
-                .unwrap_or(0)
-                .clamp(0, y_max);
-            let x = (i64::from(raw_x) * 32767 / i64::from(x_max)) as i32;
-            let y = (i64::from(raw_y) * 32767 / i64::from(y_max)) as i32;
-            ctx.scheduler.enqueue_abs_pos(now, ctx.rng, x, y);
-            accum.last_abs_x = Some(raw_x);
-            accum.last_abs_y = Some(raw_y);
+            // First-emitter-wins: the first VM tablet to emit a real ABS
+            // frame is promoted to primary. Others remain grabbed but muted
+            // so their positions can't interleave, and their buttons get
+            // dropped below (a click with no position context would fire at
+            // stale coords).
+            if !accum.is_primary_tablet && !*ctx.primary_tablet_chosen {
+                accum.is_primary_tablet = true;
+                *ctx.primary_tablet_chosen = true;
+            }
+            if accum.is_primary_tablet {
+                // Fall back to the last-seen value for the axis that didn't
+                // update this frame; only fall back to 0 on the very first
+                // frame when no prior value exists (matches the kernel's own
+                // absinfo initial state).
+                let raw_x = accum
+                    .pending_abs_x
+                    .or(accum.last_abs_x)
+                    .unwrap_or(0)
+                    .clamp(0, x_max);
+                let raw_y = accum
+                    .pending_abs_y
+                    .or(accum.last_abs_y)
+                    .unwrap_or(0)
+                    .clamp(0, y_max);
+                let x = (i64::from(raw_x) * 32767 / i64::from(x_max)) as i32;
+                let y = (i64::from(raw_y) * 32767 / i64::from(y_max)) as i32;
+                ctx.scheduler.enqueue_abs_pos(now, ctx.rng, x, y);
+                accum.last_abs_x = Some(raw_x);
+                accum.last_abs_y = Some(raw_y);
+            }
             accum.pending_abs_x = None;
             accum.pending_abs_y = None;
         }
@@ -269,7 +292,14 @@ fn flush_frame(accum: &mut FrameAccum, now: i64, ctx: &mut TranslateCtx<'_>) {
     // Flush deferred pointer-sink buttons AFTER AbsPos so the queue order
     // is [AbsPos, Button]: kloak-pointer emits the position update first
     // and the compositor registers the click at the up-to-date location.
+    // On non-primary VM tablets the buttons are dropped — their positions
+    // were just suppressed, so a click would land at stale coords.
+    let drop_buttons =
+        accum.sink == Sink::Pointer && accum.abs_x_max.is_some() && !accum.is_primary_tablet;
     for (code, pressed) in accum.pending_buttons.drain(..) {
+        if drop_buttons {
+            continue;
+        }
         ctx.scheduler
             .enqueue_button(now, ctx.rng, u32::from(code), pressed, accum.sink);
     }
@@ -299,6 +329,7 @@ mod tests {
         rng: MinRng,
         esc_combo: EscCombo,
         natural_scrolling: bool,
+        primary_tablet_chosen: bool,
     }
 
     impl Harness {
@@ -309,6 +340,7 @@ mod tests {
                 rng: MinRng,
                 esc_combo: default_combo(),
                 natural_scrolling: false,
+                primary_tablet_chosen: false,
             }
         }
 
@@ -325,6 +357,7 @@ mod tests {
                 rng: &mut self.rng,
                 esc_combo: &mut self.esc_combo,
                 natural_scrolling: self.natural_scrolling,
+                primary_tablet_chosen: &mut self.primary_tablet_chosen,
             };
             handle_raw_event(type_, code, value, &mut self.accum, 0, &mut ctx)
         }
@@ -487,6 +520,62 @@ mod tests {
             pkts[1].packet
         );
         assert_eq!(pkts[1].sink, Sink::Pointer);
+    }
+
+    #[test]
+    fn non_primary_vm_tablet_drops_abs_and_buttons() {
+        // A second VM tablet attached after the primary one: abs range known,
+        // sink=Pointer, but primary_tablet_chosen is already true (some other
+        // device won the first-emitter race). Every ABS frame and every
+        // button press must be dropped so a silent decoy can't fire clicks
+        // at stale cursor coords.
+        let mut h = Harness::new();
+        h.primary_tablet_chosen = true; // someone else already won
+        h.accum.abs_x_max = Some(1000);
+        h.accum.abs_y_max = Some(1000);
+        h.accum.sink = Sink::Pointer;
+
+        h.feed(EV_ABS, ABS_X, 500, false, false);
+        h.feed(EV_ABS, ABS_Y, 500, false, false);
+        h.feed(EV_KEY, 0x110, 1, false, false); // BTN_LEFT press
+        h.feed(EV_SYN, SYN_REPORT, 0, false, false);
+
+        let pkts = h.scheduler.pop_due(1_000_000);
+        assert_eq!(pkts.len(), 0, "non-primary tablet must emit nothing");
+        assert!(!h.accum.is_primary_tablet);
+    }
+
+    #[test]
+    fn first_vm_tablet_to_emit_abs_becomes_primary() {
+        // Two devices, both classified VmTablet, both silent at attach. When
+        // the second one emits first, it wins — not the first attached.
+        let mut h_a = Harness::new();
+        h_a.accum.abs_x_max = Some(1000);
+        h_a.accum.abs_y_max = Some(1000);
+        h_a.accum.sink = Sink::Pointer;
+
+        let mut h_b = Harness::new();
+        // Share the latch: both devices see the same `primary_tablet_chosen`
+        // in real operation. Simulate by copying after each feed.
+        h_b.accum.abs_x_max = Some(1000);
+        h_b.accum.abs_y_max = Some(1000);
+        h_b.accum.sink = Sink::Pointer;
+
+        // Device B emits first.
+        h_b.feed(EV_ABS, ABS_X, 500, false, false);
+        h_b.feed(EV_ABS, ABS_Y, 500, false, false);
+        h_b.feed(EV_SYN, SYN_REPORT, 0, false, false);
+        assert!(h_b.accum.is_primary_tablet);
+        let b_pkts = h_b.scheduler.pop_due(1_000_000);
+        assert_eq!(b_pkts.len(), 1, "first emitter produces AbsPos");
+
+        // Propagate the latch to device A, then device A emits.
+        h_a.primary_tablet_chosen = h_b.primary_tablet_chosen;
+        h_a.feed(EV_ABS, ABS_X, 100, false, false);
+        h_a.feed(EV_SYN, SYN_REPORT, 0, false, false);
+        assert!(!h_a.accum.is_primary_tablet, "A missed the race");
+        let a_pkts = h_a.scheduler.pop_due(1_000_000);
+        assert_eq!(a_pkts.len(), 0, "losing device emits nothing");
     }
 
     #[test]

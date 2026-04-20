@@ -203,7 +203,7 @@ impl EvdevDevice {
         }
     }
 
-    fn open(name: &str, suppress_vm_tablet: bool) -> io::Result<Option<Self>> {
+    fn open(name: &str) -> io::Result<Option<Self>> {
         let path: PathBuf = format!("/dev/input/{name}").into();
         let file = OpenOptions::new()
             .read(true)
@@ -229,19 +229,14 @@ impl EvdevDevice {
             DeviceClass::Skip => return Ok(None),
             DeviceClass::KeyOrRel => (None, None),
             DeviceClass::VmTablet => {
-                // Short-circuit the absinfo queries when suppressing: the
-                // range won't be used. Pass `Default` placeholders through
-                // the pure decider so the rest of the policy lives in one
-                // unit-testable function.
-                let (x_info, y_info) = if suppress_vm_tablet {
-                    (InputAbsinfo::default(), InputAbsinfo::default())
-                } else {
-                    (
-                        query_absinfo(fd, ABS_X as u8)?,
-                        query_absinfo(fd, ABS_Y as u8)?,
-                    )
-                };
-                match resolve_vm_tablet_abs(suppress_vm_tablet, x_info, y_info) {
+                // Every VM tablet reports its ABS range — normalization runs
+                // only on the device that wins the first-emitter race in
+                // translate::flush_frame, but losing devices still need the
+                // range so a later promotion (not currently used) would
+                // stay correct.
+                let x_info = query_absinfo(fd, ABS_X as u8)?;
+                let y_info = query_absinfo(fd, ABS_Y as u8)?;
+                match resolve_vm_tablet_abs(x_info, y_info) {
                     Some(pair) => pair,
                     None => return Ok(None),
                 }
@@ -297,23 +292,15 @@ impl EvdevDevice {
 
 /// VM-tablet `(abs_x_max, abs_y_max)` policy, extracted for unit testing.
 ///
-/// - `suppress=true`: another VM tablet is already tracked — grab this
-///   one (so the compositor can't double-read) but return `(None, None)`
-///   so `translate::flush_frame` drops its ABS events. Prevents two
-///   tablets interleaving cursor updates through the scheduler.
-/// - `suppress=false` + valid range: primary VM tablet; normalization uses
-///   these maxima.
-/// - `suppress=false` + non-positive range: skip entirely (the caller
-///   returns `Ok(None)` from `EvdevDevice::open`). A zero/negative maximum
-///   would divide by zero in `translate::flush_frame`.
+/// - Valid range: remember the maxima so `translate::flush_frame` can
+///   normalize ABS events to the uinput sink's 0..=32767 output range.
+/// - Non-positive range: skip entirely (the caller returns `Ok(None)` from
+///   `EvdevDevice::open`). A zero/negative maximum would divide by zero in
+///   `translate::flush_frame`.
 fn resolve_vm_tablet_abs(
-    suppress: bool,
     x_info: InputAbsinfo,
     y_info: InputAbsinfo,
 ) -> Option<(Option<i32>, Option<i32>)> {
-    if suppress {
-        return Some((None, None));
-    }
     if x_info.maximum <= 0 || y_info.maximum <= 0 {
         return None;
     }
@@ -360,8 +347,7 @@ impl EvdevCtx {
         if self.devices.contains_key(name) {
             self.detach(name);
         }
-        let suppress_vm_tablet = self.has_vm_tablet();
-        match EvdevDevice::open(name, suppress_vm_tablet) {
+        match EvdevDevice::open(name) {
             Ok(Some(dev)) => {
                 self.devices.insert(name.to_string(), dev);
             }
@@ -373,10 +359,6 @@ impl EvdevCtx {
                 eprintln!("WARNING: could not open /dev/input/{}: {}", name, e);
             }
         }
-    }
-
-    fn has_vm_tablet(&self) -> bool {
-        self.devices.values().any(|d| d.frame.abs_x_max.is_some())
     }
 
     /// Detach by short name. No-op if not tracked.
@@ -503,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn primary_vm_tablet_keeps_reported_range() {
+    fn vm_tablet_keeps_reported_range() {
         let x = InputAbsinfo {
             maximum: 32767,
             ..Default::default()
@@ -513,29 +495,8 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            resolve_vm_tablet_abs(false, x, y),
+            resolve_vm_tablet_abs(x, y),
             Some((Some(32767), Some(32767)))
-        );
-    }
-
-    #[test]
-    fn second_vm_tablet_is_grabbed_but_muted() {
-        // When another VM tablet is already tracked, the second device must
-        // be grabbed (Some(..) so EvdevDevice::open proceeds to EVIOCGRAB)
-        // but with no normalization range — translate::flush_frame drops its
-        // ABS events, so two tablets can't interleave cursor updates.
-        let x = InputAbsinfo {
-            maximum: 32767,
-            ..Default::default()
-        };
-        let y = InputAbsinfo {
-            maximum: 32767,
-            ..Default::default()
-        };
-        assert_eq!(
-            resolve_vm_tablet_abs(true, x, y),
-            Some((None, None)),
-            "suppressed tablet must be grabbed-but-muted, not skipped"
         );
     }
 
@@ -552,14 +513,13 @@ mod tests {
             maximum: 32767,
             ..Default::default()
         };
-        assert_eq!(resolve_vm_tablet_abs(false, x, y), None);
+        assert_eq!(resolve_vm_tablet_abs(x, y), None);
         let y2 = InputAbsinfo {
             maximum: -1,
             ..Default::default()
         };
         assert_eq!(
             resolve_vm_tablet_abs(
-                false,
                 InputAbsinfo {
                     maximum: 100,
                     ..Default::default()
@@ -567,21 +527,6 @@ mod tests {
                 y2
             ),
             None
-        );
-    }
-
-    #[test]
-    fn suppress_flag_overrides_zero_range_check() {
-        // When suppressing, the range check is bypassed (we won't use the
-        // range anyway). This keeps the open()-side short-circuit valid:
-        // EvdevDevice::open skips the EVIOCGABS syscalls when suppressing
-        // and passes default (zero-range) absinfo into resolve — the
-        // suppress branch must accept that and return a grabbed-but-muted
-        // device instead of skipping.
-        let zero = InputAbsinfo::default();
-        assert_eq!(
-            resolve_vm_tablet_abs(true, zero, zero),
-            Some((None, None))
         );
     }
 

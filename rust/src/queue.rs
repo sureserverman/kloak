@@ -485,7 +485,7 @@ mod tests {
         let mut s = Scheduler::new(100);
         let mut rng = MaxRng;
         s.enqueue_key(0, &mut rng, 30, true); // sched=100, prev=100
-        // now=10: lower = min(max(100-10,0), 100) = 90. MaxRng picks 100.
+                                              // now=10: lower = min(max(100-10,0), 100) = 90. MaxRng picks 100.
         s.enqueue_abs_pos(10, &mut rng, 50, 50);
         let pkts = s.peek_all();
         assert_eq!(pkts[1].sched_time, 110);
